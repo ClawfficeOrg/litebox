@@ -12,7 +12,7 @@ use litebox::{
     utils::{ReinterpretSignedExt, TruncateExt},
 };
 use litebox_common_linux::{errno::Errno, vmem::PAGE_SIZE};
-use litebox_common_lvbs::{NUM_VTLCALL_PARAMS, VsmError, VsmFunction};
+use litebox_common_lvbs::{NUM_VTLCALL_PARAMS, PRK_LEN, VsmError, VsmFunction};
 use litebox_common_optee::{
     OpteeMessageCommand, OpteeMsgArgs, OpteeMsgParamRmem, OpteeRpcArgs, OpteeRpcCommand,
     OpteeRpcShmType, OpteeSmcArgs, OpteeSmcFunction, OpteeSmcResult, OpteeSmcReturnCode, TeeOrigin,
@@ -298,10 +298,26 @@ fn vtlcall_dispatch(platform: &'static Platform, params: &[u64; NUM_VTLCALL_PARA
             let smc_args_pfn = params[1];
             optee_smc_handler_entry(platform, smc_args_pfn)
         }
-        VsmFunction::GenerateIdentitySigningKey => {
-            let public_key_pa = params[1];
-            let key_alg = params[2];
-            litebox_shim_optee::idk::generate_identity_signing_key(platform, public_key_pa, key_alg)
+        VsmFunction::SetPlatformRootKeyAndGenerateIdentitySigningKey => {
+            let tpm_random_pa = params[1];
+            let public_key_pa = params[2];
+            let key_alg = params[3];
+
+            let return_code = vsm_dispatch(
+                platform,
+                VsmFunction::SetPlatformRootKeyAndGenerateIdentitySigningKey,
+                &params[1..2],
+            );
+            if return_code < 0 {
+                return return_code;
+            }
+
+            litebox_shim_optee::idk::generate_identity_signing_key(
+                platform,
+                tpm_random_pa + PRK_LEN as u64,
+                public_key_pa,
+                key_alg,
+            )
         }
         _ => vsm_dispatch(platform, func_id, &params[1..]),
     }
@@ -354,9 +370,8 @@ fn vsm_dispatch(platform: &'static Platform, func_id: VsmFunction, params: &[u64
         VsmFunction::AllocateRingbufferMemory => {
             heki.allocate_ringbuffer_memory(params[0], params[1])
         }
-        VsmFunction::SetPlatformRootKey => vtl1.set_platform_root_key(params[0]).map(|()| 0),
-        VsmFunction::GenerateIdentitySigningKey => {
-            Err(VsmError::OperationNotSupported("Identity key generation"))
+        VsmFunction::SetPlatformRootKeyAndGenerateIdentitySigningKey => {
+            vtl1.set_platform_root_key(params[0]).map(|()| 0)
         }
         VsmFunction::OpteeMessage => Err(VsmError::OperationNotSupported("OP-TEE communication")),
     };

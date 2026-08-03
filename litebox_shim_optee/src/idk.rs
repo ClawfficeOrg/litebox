@@ -3,7 +3,8 @@
 
 use crate::syscalls::pta::PTA_DEFAULT_FLAGS;
 use crate::{
-    NormalWorldMutPtr, TA_DIGEST_LEN, TaDigest, Task, UserConstPtr, UserMutPtr, syscalls::Cleanup,
+    NormalWorldConstPtr, NormalWorldMutPtr, TA_DIGEST_LEN, TaDigest, Task, UserConstPtr, UserMutPtr,
+    syscalls::Cleanup,
 };
 use alloc::vec::Vec;
 use litebox::{
@@ -23,6 +24,7 @@ use zeroize::Zeroizing;
 
 const IDENTITY_SIGNING_PRIVATE_KEY_LEN: usize = 48;
 const IDENTITY_SIGNING_PUBLIC_KEY_LEN: usize = 97;
+const TPM_IDKS_RANDOM_LEN: usize = 32;
 const KEY_ALGORITHM_MASK: u64 = 0xff00;
 const KEY_VARIANT_MASK: u64 = 0xff;
 const KEY_ALGORITHM_VALUE_MASK: u64 = KEY_ALGORITHM_MASK | KEY_VARIANT_MASK;
@@ -166,7 +168,7 @@ impl IdksPta {
             placement,
         )
         .ok_or(TeeResult::BadParameters)?;
-        let key_pair = get_identity_signing_key_pair(task.global.platform)
+        let key_pair = get_identity_signing_key_pair(task.global.platform, None)
             .map_err(|_| TeeResult::GenericError)?;
         let signature = endorse_data_with(&endorsement, &key_pair.private_key)
             .map_err(|_| TeeResult::GenericError)?;
@@ -305,10 +307,11 @@ enum EcdsaCurve {
 
 pub fn generate_identity_signing_key<Platform: crate::OpteeShimPlatform>(
     platform: &Platform,
+    tpm_random_pa: u64,
     public_key_pa: u64,
     key_alg: u64,
 ) -> i64 {
-    match generate_identity_signing_key_inner(platform, public_key_pa, key_alg) {
+    match generate_identity_signing_key_inner(platform, tpm_random_pa, public_key_pa, key_alg) {
         Ok(res) => res,
         Err(e) => e.as_neg().into(),
     }
@@ -330,10 +333,22 @@ pub fn generate_identity_signing_key<Platform: crate::OpteeShimPlatform>(
 /// or greater than `IDENTITY_SIGNING_PUBLIC_KEY_LEN`.
 fn generate_identity_signing_key_inner<Platform: crate::OpteeShimPlatform>(
     platform: &Platform,
+    tpm_random_pa: u64,
     public_key_pa: u64,
     key_alg: u64,
 ) -> Result<i64, Errno> {
     validate_key_algorithm(key_alg)?;
+
+    let random_ptr = NormalWorldConstPtr::<Platform, u8, PAGE_SIZE>::with_contiguous_pages(
+        platform,
+        tpm_random_pa.trunc(),
+        TPM_IDKS_RANDOM_LEN,
+    )
+    .map_err(|_| Errno::EINVAL)?;
+    let mut tpm_random = [0u8; TPM_IDKS_RANDOM_LEN];
+    random_ptr
+        .read_slice_at_offset(0, &mut tpm_random)
+        .map_err(|_| Errno::EFAULT)?;
 
     let pubkey_ptr =
         NormalWorldMutPtr::<Platform, [u8; IDENTITY_SIGNING_PUBLIC_KEY_LEN], PAGE_SIZE>::with_usize(
@@ -342,7 +357,7 @@ fn generate_identity_signing_key_inner<Platform: crate::OpteeShimPlatform>(
         )
         .map_err(|_| Errno::EINVAL)?;
 
-    let key_pair = get_identity_signing_key_pair(platform)?;
+    let key_pair = get_identity_signing_key_pair(platform, Some(&tpm_random))?;
     pubkey_ptr
         .write_at_offset(0, key_pair.public_key)
         .map_err(|_| Errno::EFAULT)?;
@@ -374,9 +389,10 @@ fn validate_key_algorithm(key_alg: u64) -> Result<(), Errno> {
 
 fn get_identity_signing_key_pair<Platform: crate::OpteeShimPlatform>(
     platform: &Platform,
+    tpm_random: Option<&[u8; TPM_IDKS_RANDOM_LEN]>,
 ) -> Result<&'static IdentitySigningKeyPair, Errno> {
     IDENTITY_SIGNING_KEY_PAIR.try_call_once(|| {
-        let private_key = generate_identity_signing_private_key(platform)?;
+        let private_key = generate_identity_signing_private_key(platform, tpm_random)?;
         let public_key = identity_signing_public_key_from_private_key(&private_key)?;
         Ok(IdentitySigningKeyPair {
             private_key,
@@ -387,6 +403,7 @@ fn get_identity_signing_key_pair<Platform: crate::OpteeShimPlatform>(
 
 fn generate_identity_signing_private_key<Platform: crate::OpteeShimPlatform>(
     platform: &Platform,
+    _tpm_random: Option<&[u8; TPM_IDKS_RANDOM_LEN]>,
 ) -> Result<Zeroizing<[u8; IDENTITY_SIGNING_PRIVATE_KEY_LEN]>, Errno> {
     let mut private_key_bytes = Zeroizing::new([0u8; IDENTITY_SIGNING_PRIVATE_KEY_LEN]);
 
@@ -579,7 +596,8 @@ mod tests {
                     assert_eq!(params.get_values(2).unwrap(), None);
                     assert_eq!(&output[..expected.len()], expected);
                     assert_eq!(output[required_size], 0xcc);
-                    let key_pair = get_identity_signing_key_pair(task.global.platform).unwrap();
+                    let key_pair =
+                        get_identity_signing_key_pair(task.global.platform, None).unwrap();
                     let verifying_key =
                         VerifyingKey::from_sec1_bytes(&key_pair.public_key).unwrap();
                     let signature =
