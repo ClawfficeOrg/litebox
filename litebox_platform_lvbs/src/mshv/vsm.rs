@@ -27,8 +27,8 @@ use core::ops::Range;
 use litebox::utils::TruncateExt;
 use litebox_common_linux::vmap::PhysPageAddr;
 use litebox_common_lvbs::{
-    CRNG_SEED_LEN, FrameTxn, HypervCallError, MemAttr, PAGE_SHIFT, PAGE_SIZE,
-    ReservationStatus, VsmError, Vtl0Gate, Vtl0PrivilegedWrite, Vtl1Gate,
+    CRNG_SEED_LEN, FrameTxn, HypervCallError, MemAttr, PAGE_SHIFT, PAGE_SIZE, ReservationStatus,
+    VsmError, Vtl0Gate, Vtl0PrivilegedWrite, Vtl1Gate,
 };
 use rangemap::RangeSet;
 use spin::{Once, rwlock::RwLock as SpinRwLock};
