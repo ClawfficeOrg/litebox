@@ -127,6 +127,9 @@ pub trait Backend: private::Sealed + Send + Sync + Any {
     /// Status of an open file or directory handle.
     fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError>;
 
+    /// Query metadata without consuming or opening the resolved target.
+    fn resolved_status(&self, target: &ResolvedTarget<'_>) -> Result<FileStatus, FileStatusError>;
+
     /// Create a new file within `parent`.
     fn create_file_at(
         &self,
@@ -246,10 +249,15 @@ pub enum HandleRef<'a> {
 }
 
 trait ErasedResolvedHandle {
+    fn as_raw(&self) -> *const ();
     fn into_raw(self: Box<Self>) -> *mut ();
 }
 
 impl<H> ErasedResolvedHandle for H {
+    fn as_raw(&self) -> *const () {
+        core::ptr::from_ref(self).cast()
+    }
+
     fn into_raw(self: Box<Self>) -> *mut () {
         Box::into_raw(self).cast()
     }
@@ -266,6 +274,17 @@ impl<'a> ResolvedDir<'a> {
             raw: Box::new(handle),
             _invariant: PhantomData,
         }
+    }
+
+    pub(super) fn get_typed<B: BackendHandles + 'static>(&self) -> &B::ResolvedDir<'a> {
+        assert_eq!(
+            self.backend_type,
+            TypeId::of::<B>(),
+            "backend resolved directory type mismatch"
+        );
+        // SAFETY: The backend type check and invariant lifetime recover the allocation type
+        // stored by `from_typed`; the reference cannot outlive this borrow of the owning box.
+        unsafe { &*self.raw.as_ref().as_raw().cast::<B::ResolvedDir<'a>>() }
     }
 
     /// Recover scoped directory state passed back to the same backend.
@@ -296,6 +315,17 @@ impl<'a> ResolvedFile<'a> {
         }
     }
 
+    pub(super) fn get_typed<B: BackendHandles + 'static>(&self) -> &B::ResolvedFile<'a> {
+        assert_eq!(
+            self.backend_type,
+            TypeId::of::<B>(),
+            "backend resolved file type mismatch"
+        );
+        // SAFETY: The backend type check and invariant lifetime recover the allocation type
+        // stored by `from_typed`; the reference cannot outlive this borrow of the owning box.
+        unsafe { &*self.raw.as_ref().as_raw().cast::<B::ResolvedFile<'a>>() }
+    }
+
     /// Recover scoped file state passed back to the same backend.
     pub(super) fn into_typed<B: BackendHandles + 'static>(self) -> B::ResolvedFile<'a> {
         assert_eq!(
@@ -306,19 +336,6 @@ impl<'a> ResolvedFile<'a> {
         // SAFETY: `from_typed::<B>` records the backend type and stores a `B::ResolvedFile<'a>`.
         // The type check and lifetime invariance ensure the original allocation type is recovered.
         unsafe { *Box::from_raw(self.raw.into_raw().cast::<B::ResolvedFile<'a>>()) }
-    }
-
-    /// Borrowing version of [`Self::into_typed`].
-    pub(super) fn as_typed<B: BackendHandles + 'static>(&self) -> &B::WalkingDirHandle<'a> {
-        assert_eq!(
-            self.backend_type,
-            TypeId::of::<B>(),
-            "backend walking directory handle type mismatch"
-        );
-        // SAFETY: as in `into_typed`, the boxed value is a `B::WalkingDirHandle<'a>`; casting the
-        // trait-object pointer to a thin pointer keeps its data address, and the borrow is tied
-        // to `self`, which owns the allocation.
-        unsafe { &*core::ptr::from_ref(&*self.raw).cast::<B::WalkingDirHandle<'a>>() }
     }
 }
 
@@ -403,7 +420,7 @@ pub(super) enum PermissionCheck {
 
 /// Permission information for a particular component of the walk.
 #[derive(Clone, Debug)]
-pub(super) struct PermissionInfo {
+pub struct PermissionInfo {
     pub(super) mode: Mode,
     pub(super) owner: UserInfo,
 }

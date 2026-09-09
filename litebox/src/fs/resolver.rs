@@ -203,22 +203,47 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         let mut require_directory = path.ends_with('/');
         let mut resolved: Vec<String> = Vec::new();
         let mut links = 0;
-        // XXX(jayb): each step re-resolves from the root, since `Backend::resolve` consumes its
+        // XXX(jayb): each run re-resolves from the root, since `Backend::resolve` consumes its
         // starting directory and does not report symlinks mid-walk.
-        while let Some(name) = pending.pop_front() {
+        while let Some(name) = pending.front() {
             match name.as_str() {
-                "." => continue,
+                "." => {
+                    pending.pop_front();
+                    continue;
+                }
                 ".." => {
+                    pending.pop_front();
                     // The remaining prefix was already resolved (and search-checked) above.
                     resolved.pop();
                     continue;
                 }
                 _ => {}
             }
+            let run_len = pending
+                .iter()
+                .take_while(|part| !matches!(part.as_str(), "." | ".."))
+                .count();
+            let run_start = resolved.len();
+            resolved.extend(pending.drain(..run_len));
+            let mut end = resolved.len();
+            let resolution = loop {
+                let components: Vec<_> = resolved[..end].iter().map(String::as_str).collect();
+                match self.resolve_components(context, &components) {
+                    // A non-directory (possibly a symlink) sits mid-run; shorten the run until it
+                    // is the final component, so its type can be inspected.
+                    Err(WalkError::PathError(PathError::ComponentNotADirectory))
+                        if end > run_start + 1 =>
+                    {
+                        end -= 1;
+                    }
+                    result => break result?,
+                }
+            };
+            for part in resolved.drain(end..).rev() {
+                pending.push_front(part);
+            }
             let final_component = pending.is_empty();
-            resolved.push(name);
-            let components: Vec<_> = resolved.iter().map(String::as_str).collect();
-            match self.resolve_components(context, &components)? {
+            match resolution {
                 Resolution::Found(ResolvedTarget::Dir(_)) => {}
                 Resolution::Found(ResolvedTarget::File(file))
                     if file.file_type == FileType::SymbolicLink =>
@@ -232,7 +257,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                     if links > MAX_SYMLINKS {
                         return Err(PathError::TooManySymlinks.into());
                     }
-                    let name = resolved.pop().expect("symlink was just pushed");
+                    let name = resolved
+                        .pop()
+                        .expect("symlink is the last resolved component");
                     let parent_components: Vec<_> = resolved.iter().map(String::as_str).collect();
                     let Resolution::Found(ResolvedTarget::Dir(parent)) =
                         self.resolve_components(context, &parent_components)?
