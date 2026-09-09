@@ -189,6 +189,8 @@ pub struct ResolvedDir<'a> {
 /// A resolved, unopened non-directory target, including permission metadata for resolver authorization.
 pub struct ResolvedFile<'a> {
     pub(super) permissions: PermissionCheck,
+    /// Lets the resolver detect symlinks, which it (not the backend) expands.
+    pub(super) file_type: FileType,
     backend_type: TypeId,
     raw: Box<dyn ErasedResolvedHandle + 'a>,
     _invariant: PhantomData<fn(&'a ()) -> &'a ()>,
@@ -283,9 +285,11 @@ impl<'a> ResolvedFile<'a> {
     pub(super) fn from_typed<B: BackendHandles + 'static>(
         handle: B::ResolvedFile<'a>,
         permissions: PermissionCheck,
+        file_type: FileType,
     ) -> Self {
         Self {
             permissions,
+            file_type,
             backend_type: TypeId::of::<B>(),
             raw: Box::new(handle),
             _invariant: PhantomData,
