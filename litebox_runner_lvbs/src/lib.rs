@@ -871,7 +871,7 @@ fn handle_return_from_load_ta_binary_rpc(
             };
             let shim =
                 litebox_shim_optee::OpteeShimBuilder::new(platform, session_manager()).build();
-            if !shim.store_ta_bin(&ta_uuid, &ta_binary) {
+            if !shim.store_ta_bin(&ta_uuid, &ta_binary, litebox_shim_optee::TaSource::Dynamic) {
                 RpcCompletion::ReturnError(OpteeSmcReturnCode::EBadCmd)
             } else {
                 RpcCompletion::OpenSession
@@ -2009,7 +2009,11 @@ fn register_embedded_ta(
     let Some(ta_head) = litebox_common_optee::parse_ta_head(ta_binary) else {
         return false;
     };
-    shim.store_ta_bin(&ta_head.uuid, ta_binary)
+    shim.store_ta_bin(
+        &ta_head.uuid,
+        ta_binary,
+        litebox_shim_optee::TaSource::BuiltIn,
+    )
 }
 
 /// Register all TA binaries embedded in the runner image.
