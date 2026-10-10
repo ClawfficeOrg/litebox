@@ -3,7 +3,10 @@
 
 use super::*;
 use litebox_syscall_rewriter::{
-    RewriteOptions, TargetHost, macho::Rewriter, patch_code_segment_with_options,
+    RewriteOptions, TargetHost,
+    aarch64::{GATE_ALIGNMENT, TrampolineSpace},
+    macho::{GatePlacement, Rewriter},
+    patch_aarch64_code_segment_in_spaces,
 };
 
 // The first page contains code and gates; remaining pages are RW stack storage.
@@ -36,11 +39,17 @@ fn prepare_code(
     assert!(code.len() <= HOST_PAGE_SIZE / 2);
     let gate_address = (base + HOST_PAGE_SIZE / 2) as u64;
     let callback = platform.get_syscall_entry_point() as u64;
-    let (gates, trapped) = match abi {
-        GuestAbi::Linux => patch_code_segment_with_options(
+    let spaces = [TrampolineSpace {
+        start: gate_address,
+        end: None,
+    }];
+    let (subs, trapped) = match abi {
+        GuestAbi::Linux => patch_aarch64_code_segment_in_spaces(
             &mut code,
             base as u64,
-            gate_address,
+            None,
+            &spaces,
+            GATE_ALIGNMENT as u64,
             callback,
             RewriteOptions::new(TargetHost::MacOs, true),
         ),
@@ -52,18 +61,28 @@ fn prepare_code(
                     &mut code,
                     base as u64,
                     core::slice::from_ref(&range),
-                    gate_address,
-                    callback,
-                    u16::try_from(platform.guest_thread_pointer_offset().unwrap()).unwrap(),
+                    GatePlacement {
+                        spaces: &spaces,
+                        granule: GATE_ALIGNMENT as u64,
+                        callback,
+                        guest_tp_offset: u16::try_from(
+                            platform.guest_thread_pointer_offset().unwrap(),
+                        )
+                        .unwrap(),
+                    },
                 )
         }
     }
     .unwrap();
     assert_eq!(trapped, [] as [u64; 0]);
+    let [sub] = &subs[..] else {
+        panic!("expected one sub-trampoline");
+    };
+    let gates = &sub.data;
     assert!(gates.len() <= HOST_PAGE_SIZE / 2);
     assert_eq!(memory.write_slice_at_offset(0, &code), Some(()));
     assert_eq!(
-        memory.write_slice_at_offset((HOST_PAGE_SIZE / 2).cast_signed(), &gates),
+        memory.write_slice_at_offset((HOST_PAGE_SIZE / 2).cast_signed(), gates),
         Some(())
     );
     // SAFETY: code and gates are initialized and have no users before RX publication.
