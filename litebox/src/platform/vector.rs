@@ -18,7 +18,7 @@ pub trait GuestVectorStateProvider {
 
 // TODO: replace this blanket with architecture-specific providers before
 // implementing guest vector-state preservation outside AArch64.
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 impl<T> GuestVectorStateProvider for T {
     type GuestVectorState = ();
 

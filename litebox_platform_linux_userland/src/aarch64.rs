@@ -32,7 +32,6 @@ macro_rules! load_tls_block_base {
         )
     };
 }
-pub(super) use load_tls_block_base;
 
 macro_rules! tprel_offset {
     ($var:ident) => {
@@ -222,7 +221,8 @@ pub(super) fn set_guest_thread_pointer(value: usize) {
     }
 }
 
-pub(super) fn set_is_guest_thread(value: bool) {
+/// Updates the marker from host execution context.
+pub(super) fn set_guest_thread_marker(value: bool) {
     // SAFETY: an own-thread [`tls_offset`] slot access.
     unsafe {
         core::arch::asm! {
@@ -236,7 +236,27 @@ pub(super) fn set_is_guest_thread(value: bool) {
     }
 }
 
-pub(super) fn is_guest_thread() -> bool {
+/// Replaces the marker from host execution context.
+pub(super) fn replace_guest_thread_marker(value: bool) -> bool {
+    let previous: u32;
+    // SAFETY: an own-thread [`tls_offset`] slot access.
+    unsafe {
+        core::arch::asm! {
+            load_tls_block_base!("{tmp}"),
+            "ldrb {previous:w}, [{tmp}, #{off}]",
+            "strb {value:w}, [{tmp}, #{off}]",
+            tmp = out(reg) _,
+            previous = out(reg) previous,
+            value = in(reg) u32::from(value),
+            off = const tls_offset::IS_GUEST_THREAD,
+            options(nostack, preserves_flags)
+        }
+    }
+    previous != 0
+}
+
+/// Reads the marker from a signal context or host execution context.
+pub(super) fn is_guest_thread_from_signal_context() -> bool {
     let value: u32;
     // SAFETY: an own-thread [`tls_offset`] slot access. Also safe from a signal
     // handler: `TPIDR_EL0` is the host anchor at all times, guest code included.
@@ -251,6 +271,102 @@ pub(super) fn is_guest_thread() -> bool {
         }
     }
     value != 0
+}
+
+pub(super) fn take_pending_host_signals_bits() -> u32 {
+    let signals: u32;
+    // Atomic against this thread's signal handlers; use the ARMv8.0 baseline
+    // rather than ARMv8.1 LSE.
+    // SAFETY: reads and clears a naturally aligned `u32` in this thread's own
+    // TLS control block, whose offset from `TPIDR_EL0` is checked by
+    // `assert_tls_block_placement`.
+    unsafe {
+        core::arch::asm!(
+            load_tls_block_base!("{addr}"),
+            "add {addr}, {addr}, #{off}",
+            "2:",
+            "ldaxr {val:w}, [{addr}]",
+            "stlxr {status:w}, wzr, [{addr}]",
+            "cbnz {status:w}, 2b",
+            addr = out(reg) _,
+            val = out(reg) signals,
+            status = out(reg) _,
+            off = const tls_offset::PENDING_HOST_SIGNALS,
+            options(nostack)
+        );
+    }
+    signals
+}
+
+pub(super) fn swap_wait_waker_addr(new_addr: usize) -> usize {
+    let old_addr: usize;
+    // Atomic against `record_pending_signal` in this thread's handler.
+    // SAFETY: exchanges a naturally aligned `u64` in this thread's own TLS
+    // control block, whose offset from `TPIDR_EL0` is checked by
+    // `assert_tls_block_placement`.
+    unsafe {
+        core::arch::asm!(
+            load_tls_block_base!("{addr}"),
+            "add {addr}, {addr}, #{off}",
+            "2:",
+            "ldaxr {old}, [{addr}]",
+            "stlxr {status:w}, {new}, [{addr}]",
+            "cbnz {status:w}, 2b",
+            addr = out(reg) _,
+            old = out(reg) old_addr,
+            new = in(reg) new_addr,
+            status = out(reg) _,
+            off = const tls_offset::WAIT_WAKER_ADDR,
+            options(nostack),
+        );
+    }
+    old_addr
+}
+
+pub(super) fn clear_interrupt() {
+    // SAFETY: writes a single byte in this thread's own TLS control block.
+    unsafe {
+        core::arch::asm!(
+            load_tls_block_base!("{tmp}"),
+            "strb wzr, [{tmp}, #{off}]",
+            tmp = out(reg) _,
+            off = const tls_offset::INTERRUPT,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+pub(super) unsafe fn record_pending_signal(mask: u32) -> usize {
+    let waker_addr: usize;
+
+    // Atomic against an interrupted exchange; a plain load/or/store can lose a bit.
+    //
+    // SAFETY: both slots are in this thread's own TLS control block at offsets
+    // checked by `assert_tls_block_placement`, and both accesses are naturally aligned.
+    // The exclusive monitor reservation is opened and closed within the loop.
+    unsafe {
+        core::arch::asm!(
+            load_tls_block_base!("{block}"),
+            "add {addr}, {block}, #{pending_off}",
+            "2:",
+            "ldaxr {old:w}, [{addr}]",
+            "orr {new:w}, {old:w}, {mask:w}",
+            "stlxr {status:w}, {new:w}, [{addr}]",
+            "cbnz {status:w}, 2b",
+            "ldr {waker}, [{block}, #{waker_off}]",
+            block = out(reg) _,
+            addr = out(reg) _,
+            old = out(reg) _,
+            new = out(reg) _,
+            status = out(reg) _,
+            waker = out(reg) waker_addr,
+            mask = in(reg) mask,
+            pending_off = const tls_offset::PENDING_HOST_SIGNALS,
+            waker_off = const tls_offset::WAIT_WAKER_ADDR,
+            options(nostack)
+        );
+    }
+    waker_addr
 }
 
 pub(super) fn get_guest_thread_pointer() -> usize {
@@ -1338,8 +1454,15 @@ pub(super) fn get_guest_vector_state() -> GuestVectorState {
     }
 }
 
+/// Prepares guest vector state for entry, optionally using inherited state.
+pub(super) fn prepare_guest_vector_state(inherited: Option<&GuestVectorState>) {
+    if let Some(state) = inherited {
+        set_guest_vector_state(state);
+    }
+}
+
 /// Replaces the current thread's platform-owned guest vector state.
-pub(super) fn set_guest_vector_state(state: &GuestVectorState) {
+fn set_guest_vector_state(state: &GuestVectorState) {
     let block: usize;
     // SAFETY: callers run on an initialized guest thread with guest execution
     // stopped, giving exclusive access to this aligned TLS slot. Volatile
@@ -1356,10 +1479,52 @@ pub(super) fn set_guest_vector_state(state: &GuestVectorState) {
 }
 
 unsafe extern "C" {
+    pub(super) fn syscall_callback() -> isize;
+    pub(super) fn syscall_callback_in_guest_cleared();
+    pub(super) fn exception_callback();
+    pub(super) fn interrupt_callback();
+    pub(super) fn switch_to_guest_via_outbound_stub_start();
+    pub(super) fn switch_to_guest_via_outbound_stub_end();
+    pub(super) fn switch_to_guest_via_sigreturn_start();
+    pub(super) fn switch_to_guest_via_sigreturn_end();
+    #[cfg(test)]
+    fn switch_to_guest_stage_x16();
+    #[cfg(test)]
+    fn switch_to_guest_stage_x16_end();
+    #[cfg(test)]
+    fn switch_to_guest_stage_x16_fixup();
+
     /// The compiler runtime's cache-synchronization helper: cleans the data
     /// cache to the point of unification and invalidates the instruction cache
     /// over `[start, end)`.
     fn __clear_cache(start: *mut core::ffi::c_char, end: *mut core::ffi::c_char);
+}
+
+pub(super) fn syscall_entry_point() -> usize {
+    syscall_callback as *const () as usize
+}
+
+pub(super) fn in_switch_to_guest(pc: usize) -> bool {
+    fn body(start: unsafe extern "C" fn(), end: unsafe extern "C" fn()) -> core::ops::Range<usize> {
+        start as *const () as usize..end as *const () as usize
+    }
+
+    body(
+        switch_to_guest_via_outbound_stub_start,
+        switch_to_guest_via_outbound_stub_end,
+    )
+    .contains(&pc)
+        || body(
+            switch_to_guest_via_sigreturn_start,
+            switch_to_guest_via_sigreturn_end,
+        )
+        .contains(&pc)
+}
+
+pub(super) fn in_syscall_callback_prologue(ip: usize) -> bool {
+    // The label keeps the multi-instruction bound tied to the asm.
+    let start = syscall_callback as *const () as usize;
+    (start..syscall_callback_in_guest_cleared as *const () as usize).contains(&ip)
 }
 
 /// Make code just written to `range` visible to the instruction fetch path,
@@ -1694,6 +1859,73 @@ mod tests {
     use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
     use litebox_common_linux::PtRegs;
     use litebox_common_linux::signal::{SigSet, Signal};
+
+    #[test]
+    fn spawned_thread_installs_inherited_vector_state() {
+        use litebox::platform::{GuestVectorStateProvider as _, ThreadProvider as _};
+        use litebox::shim::InitThread;
+
+        struct ObserveInit(std::sync::mpsc::Sender<litebox_common_linux::GuestVectorState>);
+        struct ObserveShim(std::sync::mpsc::Sender<litebox_common_linux::GuestVectorState>);
+
+        impl InitThread for ObserveInit {
+            type ExecutionContext = litebox_common_linux::PtRegs;
+
+            fn init(
+                self: Box<Self>,
+            ) -> Box<dyn EnterShim<ExecutionContext = Self::ExecutionContext>> {
+                Box::new(ObserveShim(self.0))
+            }
+        }
+
+        impl EnterShim for ObserveShim {
+            type ExecutionContext = litebox_common_linux::PtRegs;
+
+            fn init(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+                self.0.send(get_guest_vector_state()).unwrap();
+                ContinueOperation::Terminate
+            }
+
+            fn syscall(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+                unreachable!()
+            }
+
+            fn exception(
+                &self,
+                _ctx: &mut Self::ExecutionContext,
+                _info: &litebox::shim::ExceptionInfo,
+            ) -> ContinueOperation {
+                unreachable!()
+            }
+
+            fn interrupt(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+                unreachable!()
+            }
+        }
+
+        let platform = LinuxUserland::new();
+        let original = platform.get_guest_vector_state();
+        let expected = litebox_common_linux::GuestVectorState {
+            registers: core::array::from_fn(|index| index as u128 * 0x101),
+            fpsr: 0x1234,
+            fpcr: 0x5678,
+        };
+        platform.set_guest_vector_state(&expected);
+        let (send, receive) = std::sync::mpsc::channel();
+        unsafe {
+            platform
+                .spawn_thread(
+                    &litebox_common_linux::PtRegs::default(),
+                    Box::new(ObserveInit(send)),
+                )
+                .unwrap();
+        }
+        let observed = receive
+            .recv_timeout(core::time::Duration::from_secs(5))
+            .unwrap();
+        platform.set_guest_vector_state(&original);
+        assert_eq!(observed, expected);
+    }
 
     fn live_fp_state() -> FpState {
         let status: u64;
@@ -2071,7 +2303,7 @@ mod tests {
                 _ => unreachable!(),
             };
             let mut reader = fixture_reader(&code, &trampoline, &[], &guest_tp);
-            let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+            let result = super::canonicalize_aarch64_gate_signal_context(
                 &context,
                 &saved,
                 0x500000,
@@ -2123,7 +2355,7 @@ mod tests {
             };
             context.uc_mcontext.regs[5] = saved.regs[5] as u64;
             let mut reader = fixture_reader(&code, &trampoline, &frame, &guest_tp);
-            let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+            let result = super::canonicalize_aarch64_gate_signal_context(
                 &context,
                 &saved,
                 0x500000,
@@ -2165,7 +2397,7 @@ mod tests {
             } else {
                 0x1004
             };
-            let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+            let result = super::canonicalize_aarch64_gate_signal_context(
                 &context,
                 &saved,
                 0x500000,
@@ -2196,7 +2428,7 @@ mod tests {
         for offset in [36usize, 40, 44] {
             context.uc_mcontext.pc = 0x400010 + offset as u64;
             for (stub, pc) in [(0, 0x1004), (0x400010 + 36, 0), (0x400010 + 36, 0x2004)] {
-                let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+                let result = super::canonicalize_aarch64_gate_signal_context(
                     &context,
                     &saved,
                     0x500000,
@@ -2870,7 +3102,7 @@ mod tests {
         // `NotGate`. No failure may mutate the saved registers.
         for denied_address in [0x400010usize, 0x1000, 0x8000] {
             let mut reader = fixture_reader(&code, &trampoline, &frame, &[]);
-            let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+            let result = super::canonicalize_aarch64_gate_signal_context(
                 &context,
                 &saved,
                 0x500000,
@@ -2891,7 +3123,7 @@ mod tests {
 
         let mut wrong_branch = code.clone();
         wrong_branch.copy_from_slice(&0x1400_0000u32.to_le_bytes());
-        let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+        let result = super::canonicalize_aarch64_gate_signal_context(
             &context,
             &saved,
             0x500000,
@@ -2904,7 +3136,7 @@ mod tests {
 
         let mut wrong_template = trampoline.clone();
         wrong_template[16 + 8..16 + 12].copy_from_slice(&0xd503_201fu32.to_le_bytes());
-        let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+        let result = super::canonicalize_aarch64_gate_signal_context(
             &context,
             &saved,
             0x500000,
@@ -2916,7 +3148,7 @@ mod tests {
         assert_eq!(ptregs_bytes(&saved), before);
 
         frame[16..24].copy_from_slice(&0xdead_beef_u64.to_le_bytes());
-        let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+        let result = super::canonicalize_aarch64_gate_signal_context(
             &context,
             &saved,
             0x500000,
@@ -2928,7 +3160,7 @@ mod tests {
         assert_eq!(ptregs_bytes(&saved), before);
 
         context.uc_mcontext.pc = 0x400010 + 24;
-        let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+        let result = super::canonicalize_aarch64_gate_signal_context(
             &context,
             &saved,
             0x500000,
@@ -2974,7 +3206,7 @@ mod tests {
             (0x400010 + 60, false, "SVC metadata"),
         ] {
             context.uc_mcontext.pc = pc;
-            let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+            let result = super::canonicalize_aarch64_gate_signal_context(
                 &context,
                 &saved,
                 0x500000,
@@ -2999,7 +3231,7 @@ mod tests {
         ] {
             let mut mutated = trampoline.clone();
             mutated[16 + word_offset..16 + word_offset + 4].copy_from_slice(&0u32.to_le_bytes());
-            let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+            let result = super::canonicalize_aarch64_gate_signal_context(
                 &context,
                 &saved,
                 0x500000,
@@ -3012,7 +3244,7 @@ mod tests {
 
         let mut bad_metadata = trampoline.clone();
         bad_metadata[16 + 60] ^= 0x80;
-        let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+        let result = super::canonicalize_aarch64_gate_signal_context(
             &context,
             &saved,
             0x500000,
@@ -3028,7 +3260,7 @@ mod tests {
             (0x1400_0001, "inbound B wrong target"),
         ] {
             let wrong_code = branch.to_le_bytes();
-            let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+            let result = super::canonicalize_aarch64_gate_signal_context(
                 &context,
                 &saved,
                 0x500000,
@@ -3058,7 +3290,7 @@ mod tests {
         assert_eq!(trapped, []);
         second_slot.copy_from_slice(&relocated[16..80]);
         context.uc_mcontext.pc = second_pc as u64;
-        let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+        let result = super::canonicalize_aarch64_gate_signal_context(
             &context,
             &saved,
             0x500000,
@@ -3089,7 +3321,7 @@ mod tests {
         // Gate stack arithmetic wraps exactly like the AArch64 ADD/SUB pair.
         context.uc_mcontext.pc = 0x400010 + 4;
         context.uc_mcontext.sp = u64::MAX - 15;
-        let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+        let result = super::canonicalize_aarch64_gate_signal_context(
             &context,
             &saved,
             0x500000,
@@ -3108,7 +3340,7 @@ mod tests {
         let (code, trampoline, mut context, saved) = gate_fixture(0xd53b_d049);
         context.uc_mcontext.pc = 0x400010 + 4;
         let before = (saved.regs, saved.sp, saved.pc, saved.pstate, saved.orig_x0);
-        let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+        let result = super::canonicalize_aarch64_gate_signal_context(
             &context,
             &saved,
             0x500000,
@@ -3144,7 +3376,7 @@ mod tests {
             } else {
                 0xfeed_f000_0000_0010
             };
-            let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+            let result = super::canonicalize_aarch64_gate_signal_context(
                 &context,
                 &saved,
                 0x500000,
@@ -3177,7 +3409,7 @@ mod tests {
                 0x8000
             };
             context.uc_mcontext.regs[5] = saved.regs[5] as u64;
-            let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+            let result = super::canonicalize_aarch64_gate_signal_context(
                 &context,
                 &saved,
                 0x500000,
@@ -3202,7 +3434,7 @@ mod tests {
         context.uc_mcontext.regs[5] = saved.regs[5] as u64;
         let captured = saved.regs[5].to_ne_bytes();
         let mut reader = fixture_reader(&msr_code, &msr_slot, &[], &[]);
-        let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+        let result = super::canonicalize_aarch64_gate_signal_context(
             &context,
             &saved,
             0x500000,
@@ -3230,7 +3462,7 @@ mod tests {
         for offset in [12usize, 20, 24] {
             context.uc_mcontext.pc = 0x400010 + offset as u64;
             context.uc_mcontext.sp = 0x8000;
-            let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+            let result = super::canonicalize_aarch64_gate_signal_context(
                 &context,
                 &saved,
                 0x500000,
@@ -3248,7 +3480,7 @@ mod tests {
         for offset in (0usize..=32).step_by(4) {
             context.uc_mcontext.pc = 0x400010 + offset as u64;
             context.uc_mcontext.sp = if offset == 0 { 0x8020 } else { 0x8000 };
-            let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+            let result = super::canonicalize_aarch64_gate_signal_context(
                 &context,
                 &saved,
                 0x500000,
@@ -3319,7 +3551,7 @@ mod tests {
         trampoline[28..32].copy_from_slice(&0x1f11_b807u32.to_le_bytes());
         context.uc_mcontext.pc = 0x400010;
 
-        let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+        let result = super::canonicalize_aarch64_gate_signal_context(
             &context,
             &saved,
             0x500000,
@@ -3344,7 +3576,7 @@ mod tests {
             frame[8..16].copy_from_slice(&0x1717u64.to_ne_bytes());
             frame[16..24].copy_from_slice(&(expected as u64).to_ne_bytes());
 
-            let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+            let result = super::canonicalize_aarch64_gate_signal_context(
                 &context,
                 &saved,
                 0x500000,
@@ -3390,13 +3622,14 @@ mod tests {
         // waker slot is null on this thread (asserted below), so no waker is
         // dereferenced.
         assert_eq!(read_tls_slot!(usize, tls_offset::WAIT_WAKER_ADDR), 0);
+        let alarm_bit = 1u32 << (Signal::SIGALRM.as_i32() - 1);
+        let interrupt_bit = 1u32 << (Signal::SIGINT.as_i32() - 1);
         unsafe {
-            super::record_pending_signal(Signal::SIGALRM);
-            super::record_pending_signal(Signal::SIGINT);
+            super::record_pending_signal(alarm_bit);
+            super::record_pending_signal(interrupt_bit);
         }
 
-        let expected_bits =
-            (1u32 << (Signal::SIGALRM.as_i32() - 1)) | (1u32 << (Signal::SIGINT.as_i32() - 1));
+        let expected_bits = alarm_bit | interrupt_bit;
         assert_eq!(
             read_tls_slot!(u32, tls_offset::PENDING_HOST_SIGNALS),
             expected_bits,
@@ -3488,38 +3721,44 @@ mod tests {
 
         assert!(result.is_err(), "the panic must propagate to the caller");
         assert!(
-            !super::is_guest_thread(),
+            !super::is_guest_thread_from_signal_context(),
             "unwinding must run `GuestThreadMarker`'s drop"
         );
     }
 
     #[test]
     fn test_guest_thread_marker() {
-        assert!(!is_guest_thread(), "a plain test thread is not a guest");
+        assert!(
+            !is_guest_thread_from_signal_context(),
+            "a plain test thread is not a guest"
+        );
 
         {
             let _outer = GuestThreadMarker::enter();
-            assert!(is_guest_thread());
+            assert!(is_guest_thread_from_signal_context());
             {
                 let _inner = GuestThreadMarker::enter();
-                assert!(is_guest_thread());
+                assert!(is_guest_thread_from_signal_context());
             }
             assert!(
-                is_guest_thread(),
+                is_guest_thread_from_signal_context(),
                 "dropping a nested marker must not un-mark the thread while \
                  an outer frame is still running the guest"
             );
         }
-        assert!(!is_guest_thread(), "the outermost marker must restore");
+        assert!(
+            !is_guest_thread_from_signal_context(),
+            "the outermost marker must restore"
+        );
 
         let result = std::panic::catch_unwind(|| {
             let _marker = GuestThreadMarker::enter();
-            assert!(is_guest_thread());
+            assert!(is_guest_thread_from_signal_context());
             panic!("unwind out of guest execution");
         });
         assert!(result.is_err());
         assert!(
-            !is_guest_thread(),
+            !is_guest_thread_from_signal_context(),
             "the marker must be restored when the guest frame unwinds"
         );
     }
@@ -3624,7 +3863,7 @@ mod tests {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "aarch64::tests::nested_exception_during_sigsys_preserves_guest_context",
+                    "arch::tests::nested_exception_during_sigsys_preserves_guest_context",
                     "--nocapture",
                 ])
                 .env(CHILD_ENV, "1")
