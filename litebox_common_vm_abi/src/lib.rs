@@ -793,6 +793,24 @@ impl UpcallFrame {
     }
 }
 
+/// The wall clock, as the Unix time at a TSC value: at TSC `tsc`, it was
+/// `unix_ns` nanoseconds since the Unix epoch. Without a source of the time,
+/// [`Self::EPOCH_AT_BOOT`].
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+#[repr(C)]
+pub struct WallClock {
+    pub unix_ns: u64,
+    pub tsc: u64,
+}
+
+impl WallClock {
+    /// The clock starts at the Unix epoch when the TSC did, about when the
+    /// machine started: dates are fake, but intervals are right.
+    pub const EPOCH_AT_BOOT: Self = Self { unix_ns: 0, tsc: 0 };
+}
+
 /// Read-only; its address is the entry point's `rdi`. Regions are in
 /// [`RUNNER_MANAGED_MAX`]..[`USER_END`] and fixed for the process's
 /// lifetime.
@@ -806,6 +824,7 @@ pub struct StartupInfo {
     pub max_log_level: u32,
     /// `rdtsc` is allowed in ring 3.
     pub tsc_khz: u64,
+    pub wall_clock: WallClock,
     /// Fixed at creation; its meaning is the protocol's (e.g.
     /// [`envelope::Protocol::OPTEE_MSG`]).
     pub identity: [u8; IDENTITY_LEN],

@@ -38,6 +38,7 @@ fn kernel_main(kernel: Kernel) -> ! {
     let payload =
         payload::Payload::read(kernel.boot_info).unwrap_or_else(|e| panic!("payload: {e}"));
     let devices = devices::Devices::init(kernel.platform, kernel.clock);
+    let wall_clock = devices::wall_clock(kernel.platform);
     let broker = |console| {
         litebox_broker_vm_kernel::Broker::new(litebox_broker_vm_kernel::Config {
             console,
@@ -52,13 +53,19 @@ fn kernel_main(kernel: Kernel) -> ! {
         let mut service = service::program::Programs::new(
             kernel.platform,
             kernel.clock,
+            wall_clock,
             &payload,
             broker(output),
         );
         client::program::run(programs, &mut service, output);
     } else {
-        let mut service =
-            service::optee::Optee::new(kernel.platform, kernel.clock, &payload, broker(devices));
+        let mut service = service::optee::Optee::new(
+            kernel.platform,
+            kernel.clock,
+            wall_clock,
+            &payload,
+            broker(devices),
+        );
         client::script::run(&payload, &mut service);
     }
     serial_println!("[litebox] ALL TESTS PASSED");
