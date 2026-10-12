@@ -1,7 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Console: a 16550 UART on COM1. Output is dropped if no UART answers.
+//! The serial port, for the kernel's own output: a 16550 UART on COM1.
+//! Output is dropped if no UART answers.
 
 use core::fmt;
 use spin::{Mutex, Once};
@@ -77,14 +78,18 @@ impl ComPort {
         }
     }
 
-    fn write_string(&mut self, s: &str) {
+    fn write_bytes(&mut self, bytes: &[u8]) {
         if !self.available {
             return;
         }
 
-        for byte in s.bytes() {
+        for &byte in bytes {
             self.write_byte(byte);
         }
+    }
+
+    fn write_string(&mut self, s: &str) {
+        self.write_bytes(s.as_bytes());
     }
 }
 
@@ -114,6 +119,11 @@ pub fn print_str(s: &str) {
     com().lock().write_string(s);
 }
 
+/// Non-printable bytes show as `0xfe`.
+pub fn print_bytes(bytes: &[u8]) {
+    com().lock().write_bytes(bytes);
+}
+
 /// Panic may interrupt a locked or initializing console. Never wait for it
 /// or alias its mutable handle; emergency output may interleave.
 pub fn panic_print(args: core::fmt::Arguments) {
@@ -129,9 +139,9 @@ pub fn panic_print(args: core::fmt::Arguments) {
     let _ = com.write_fmt(args);
 }
 
-/// `println!` to the console.
+/// `println!` to the serial port.
 #[macro_export]
-macro_rules! console_println {
-    () => ($crate::console::print(format_args!("\n")));
-    ($($arg:tt)*) => ($crate::console::print(format_args!("{}\n", format_args!($($arg)*))));
+macro_rules! serial_println {
+    () => ($crate::serial::print(format_args!("\n")));
+    ($($arg:tt)*) => ($crate::serial::print(format_args!("{}\n", format_args!($($arg)*))));
 }

@@ -6,7 +6,8 @@
 //! `litebox_runner_optee_on_vm_userland` processes, one per TA instance
 //! ([`service::optee`]),
 //! driven by a test client ([`client::script`]). QEMU exits with 33 if all
-//! tests pass, 65 otherwise.
+//! tests pass, 65 otherwise. Runner processes' standard streams are the
+//! VM's console device, if there is one ([`devices`]).
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -16,12 +17,13 @@
 extern crate alloc;
 
 mod client;
+mod devices;
 mod payload;
 mod service;
 
 use core::panic::PanicInfo;
 use litebox_bootloader::Kernel;
-use litebox_hal::{console, console_println, power};
+use litebox_hal::{power, serial, serial_println};
 use litebox_platform_vm_kernel::providers::set_platform_root_key;
 
 litebox_bootloader::entry!(kernel_main, &SerialLogger);
@@ -30,9 +32,14 @@ fn kernel_main(kernel: Kernel) -> ! {
     set_platform_root_key(&litebox_hal::prk::development());
     let payload =
         payload::Payload::read(kernel.boot_info).unwrap_or_else(|e| panic!("payload: {e}"));
-    let mut service = service::optee::Optee::new(kernel.platform, kernel.tsc_khz, &payload);
+    let devices = devices::Devices::init(kernel.platform, kernel.clock);
+    let broker = litebox_broker_vm_kernel::Broker::new(litebox_broker_vm_kernel::Config {
+        console: devices,
+        events: devices,
+    });
+    let mut service = service::optee::Optee::new(kernel.platform, kernel.clock, &payload, broker);
     client::script::run(&payload, &mut service);
-    console_println!("[litebox] ALL TESTS PASSED");
+    serial_println!("[litebox] ALL TESTS PASSED");
     power::exit(true)
 }
 
@@ -49,7 +56,7 @@ impl log::Log for SerialLogger {
         }
         let mut buf: arrayvec::ArrayString<1024> = arrayvec::ArrayString::new();
         let _ = litebox_util_log::format_record(&mut buf, record);
-        console::print_str(&buf);
+        serial::print_str(&buf);
     }
 
     fn flush(&self) {}
@@ -71,7 +78,7 @@ fn is_spurious_tar_error(record: &log::Record) -> bool {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    console::panic_print(format_args!(
+    serial::panic_print(format_args!(
         "[litebox] PANIC: {info}\n[litebox] TESTS FAILED\n"
     ));
     power::exit(false)
