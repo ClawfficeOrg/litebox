@@ -99,6 +99,7 @@ unsafe extern "C" fn reenter_handler(thread_ctx: &mut ThreadContext) {
 }
 
 unsafe extern "C" fn syscall_handler(thread_ctx: &mut ThreadContext) {
+    crate::wait::guest_entered();
     thread_ctx.call_shim(|shim, ctx| shim.syscall(ctx));
 }
 
@@ -108,6 +109,7 @@ unsafe extern "C" fn guest_exception_handler(
     error_code: u64,
     fault_address: u64,
 ) {
+    crate::wait::guest_entered();
     let info = ExceptionInfo {
         exception: Exception(u8::try_from(vector).unwrap_or(u8::MAX)),
         error_code: u32::try_from(error_code).unwrap_or(u32::MAX),

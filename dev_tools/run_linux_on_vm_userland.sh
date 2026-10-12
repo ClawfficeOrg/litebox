@@ -18,7 +18,8 @@
 # misses (reflect.c).
 #
 # Runner processes' standard streams are a virtio console, backed by files;
-# <test>.stdin.txt, if any, is its input.
+# <test>.stdin.txt, if any, is its input, which arrives STDIN_DELAY seconds
+# after the VM starts, so that reads wait for it.
 #
 # Usage: dev_tools/run_linux_on_vm_userland.sh [-t <test>]... [-r] [-v]
 #   -t   test to run, e.g. hello (repeatable; default: every test)
@@ -27,6 +28,7 @@
 #
 # Environment:
 #   CC            C compiler with a static libc (default: cc)
+#   STDIN_DELAY   seconds before a test's input arrives (default: 3)
 #   QEMU          QEMU binary/command (default: qemu-system-x86_64)
 #   QEMU_ACCEL    kvm or tcg (default: kvm if /dev/kvm is usable, else tcg)
 #   QEMU_CPU      QEMU CPU model (default: host,+invtsc for kvm, max for tcg)
@@ -38,6 +40,7 @@
 
 set -euo pipefail
 
+STDIN_DELAY=${STDIN_DELAY:-3}
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_DIR=$(dirname "$SCRIPT_DIR")
 KERNEL_DIR="$REPO_DIR/litebox_runner_vm_kernel"
@@ -87,10 +90,22 @@ for src in "$TESTS_DIR"/*.c; do
 done
 (cd "$WORK/rootfs" && tar --format=ustar --owner=0 --group=0 -cf "$WORK/rootfs.tar" -- *)
 
+# Feeds test $1's input, if any, STDIN_DELAY seconds after QEMU opens it,
+# through a FIFO, so programs normally wait for it. Sets `feeder`.
+feed_stdin() {
+    local input="$TESTS_DIR/$1.stdin.txt" fifo="$WORK/$1.stdin"
+    feeder=
+    if [[ -f $input ]]; then
+        mkfifo "$fifo"
+        { sleep "$STDIN_DELAY"; cat "$input"; } >"$fifo" &
+        feeder=$!
+    else
+        : >"$fifo"
+    fi
+}
+
 # The virtio console's files for test $1.
 console_args() {
-    local input="$TESTS_DIR/$1.stdin.txt"
-    if [[ -f $input ]]; then cp "$input" "$WORK/$1.stdin"; else : >"$WORK/$1.stdin"; fi
     : >"$WORK/$1.stdout"
     echo -device virtio-serial-pci,id=vs0,disable-legacy=on \
         -chardev "file,id=con0,path=$WORK/$1.stdout,input-path=$WORK/$1.stdin" \
@@ -115,8 +130,14 @@ for t in "${tests[@]}"; do
     cp "$TESTS_DIR/$t.json" "$WORK/$t/programs.json"
     tar --format=ustar -cf "$WORK/$t.tar" -C "$WORK/$t" runner.elf rootfs.tar programs.json
     failed_before=$fail
+    feed_stdin "$t"
     # shellcheck disable=SC2046 # console_args prints separate arguments
     run_vm "$t" "$KERNEL" "$WORK/$t.tar" $(console_args "$t")
+    # Still waiting for QEMU, if it never opened the input.
+    if [[ -n $feeder ]]; then
+        kill "$feeder" 2>/dev/null || true
+        wait "$feeder" 2>/dev/null || true
+    fi
     if [[ $fail -ne $failed_before ]]; then
         echo "      console:"
         sed 's/^/      > /' "$WORK/$t.stdout" | tail -20

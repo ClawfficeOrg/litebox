@@ -12,20 +12,29 @@
 //! Time: monotonic clocks are the TSC; the wall clock (`time`,
 //! `gettimeofday`, `CLOCK_REALTIME`) is the kernel's, read from kvm-clock at
 //! boot and advanced by the TSC, or, without kvm-clock (e.g., under QEMU's
-//! TCG), starting at the Unix epoch. Waits with a timeout (`nanosleep`,
-//! `sleep`, timed futex waits) halt until it passes.
+//! TCG), starting at the Unix epoch. Timer files are broker timers; `alarm`
+//! and `setitimer` raise `SIGALRM` from platform timers.
+//!
+//! Waits (see `litebox_platform_vm_userland::wait`) end at their timeout, a
+//! platform timer, or a broker notification (a timer file's expiry, or
+//! standard input arriving), which [`BrokerEvents`] dispatches; each syscall
+//! also dispatches those already published, so nonblocking checks see them.
+//! Timer signals and timer files' readiness arrive at the program's next
+//! syscall or wait (a timer file's within about a millisecond of it).
 //!
 //! Limits, which end the runner (the kernel sees it exit with
 //! `EXIT_FAILURE`) rather than fail the program's call:
-//! - One thread, and no timers or asynchronous signals: a wait without a
-//!   timeout, e.g., a read of standard input before it has data, could never
-//!   end.
+//! - One thread: a wait that nothing could end (no timeout, no armed timer,
+//!   and no input that could arrive).
 
 use alloc::boxed::Box;
 use litebox::utils::TruncateExt as _;
+use litebox_broker_local_vm_userland::{ChannelError, Notifications};
+use litebox_broker_protocol::message::BrokerNotification;
 use litebox_broker_protocol::process::ProcessExitStatus;
 use litebox_common_vm_abi::program::{self, ExitStatus, Program};
-use litebox_common_vm_abi::{CallId, CallSet, Message, ProtSet, StartupInfo, UserRange};
+use litebox_common_vm_abi::{CallId, CallSet, Message, ProtSet, StartupInfo, Status, UserRange};
+use litebox_platform_vm_userland::wait::EventSource;
 use litebox_platform_vm_userland::{VmUserland, kcall};
 use litebox_shim_linux::{LinuxShim, LoadedProgram};
 
@@ -47,14 +56,17 @@ const SERVING_CALLS: CallSet = CallSet::EMPTY
 
 pub fn serve(info: &StartupInfo) -> ! {
     let platform: &'static Platform = Box::leak(Box::new(VmUserland::new(info)));
-    // Kept for the process's lifetime; nothing waits for notifications yet.
-    let (local, _notifications) = litebox_broker_local_vm_userland::connect(info)
+    let (local, notifications) = litebox_broker_local_vm_userland::connect(info)
         .unwrap_or_else(|e| panic!("broker association: {e:?}"));
     kcall::restrict(CallSet::ALL.without(CallId::BrokerHandshake), ProtSet::ALL)
         .unwrap_or_else(|status| panic!("lockdown: {status:?}"));
     let (litebox, process_id, initial_thread) =
         litebox::LiteBox::new_process_with_broker_local(platform, local);
     let process_id = i32::try_from(process_id.0).expect("process ID fits pid_t");
+    platform.set_event_source(Box::leak(Box::new(BrokerEvents {
+        notifications: spin::Mutex::new(notifications),
+        dispatch: litebox.broker_notification_dispatcher(),
+    })));
     let shim =
         litebox_shim_linux::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id)
             .build();
@@ -79,6 +91,38 @@ pub fn serve(info: &StartupInfo) -> ! {
     });
     // One program per process.
     panic!("a request after the program's exit status")
+}
+
+/// Waits end at broker notifications, e.g., a timer's expiry or standard
+/// input arriving, which wake the guest's pollers.
+struct BrokerEvents<Dispatch> {
+    notifications: spin::Mutex<Notifications>,
+    dispatch: Dispatch,
+}
+
+impl<Dispatch: Fn(BrokerNotification) + Sync> EventSource for BrokerEvents<Dispatch> {
+    fn wait(&self, deadline: Option<u64>) -> bool {
+        let mut notifications = self
+            .notifications
+            .try_lock()
+            .expect("one thread waits at a time");
+        match notifications.receive(deadline.unwrap_or(0), &self.dispatch) {
+            Ok(_) => true,
+            // Nothing could publish: no input to come, and no timer armed.
+            Err(ChannelError::Kernel(Status::Stalled)) => false,
+            Err(error) => panic!("waiting for broker notifications: {error}"),
+        }
+    }
+
+    fn poll(&self, refresh: bool) {
+        // Held only while waiting, which dispatches anyway.
+        let Some(mut notifications) = self.notifications.try_lock() else {
+            return;
+        };
+        if let Err(error) = notifications.poll(refresh, &self.dispatch) {
+            panic!("polling broker notifications: {error}");
+        }
+    }
 }
 
 /// # Safety

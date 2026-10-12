@@ -11,6 +11,7 @@ litebox_broker_local_vm_userland = { version = "0.1.0", path = "../litebox_broke
 litebox_common_linux = { version = "0.1.0", path = "../litebox_common_linux" }
 litebox_common_vm_abi = { version = "0.1.0", path = "../litebox_common_vm_abi" }
 litebox_platform_vm_userland = { version = "0.1.0", path = "../litebox_platform_vm_userland" }
+spin = { version = "0.10.0", default-features = false, features = ["spin_mutex"] }
 litebox_shim_linux = { version = "0.1.0", path = "../litebox_shim_linux", default-features = false }
 
 [lints]

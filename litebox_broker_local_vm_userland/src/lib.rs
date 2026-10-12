@@ -427,6 +427,42 @@ impl Notifications {
         self.consumer.publish_head().map_err(ChannelError::Ring)?;
         Ok(received)
     }
+
+    /// Passes the notifications already published to `dispatch`, without
+    /// waiting; with `refresh`, first has the kernel publish what is due
+    /// (e.g., expired timers), at the cost of a kernel entry. Returns how
+    /// many it passed.
+    ///
+    /// # Errors
+    ///
+    /// A malformed ring, or a kernel call the kernel rejects.
+    pub fn poll(
+        &mut self,
+        refresh: bool,
+        mut dispatch: impl FnMut(BrokerNotification),
+    ) -> Result<usize, ChannelError> {
+        if refresh {
+            broker_wake().map_err(ChannelError::Kernel)?;
+        }
+        let mut received = 0;
+        loop {
+            match self.consumer.try_read(wire::decode_notification) {
+                Ok(ControlRingReadStatus::Message(notification)) => {
+                    dispatch(notification);
+                    received += 1;
+                }
+                Ok(ControlRingReadStatus::Empty { .. }) => break,
+                Err(ControlRingReadError::Ring(error)) => return Err(ChannelError::Ring(error)),
+                Err(ControlRingReadError::Decode(error)) => {
+                    return Err(ChannelError::Wire(error));
+                }
+            }
+        }
+        if received != 0 {
+            self.consumer.publish_head().map_err(ChannelError::Ring)?;
+        }
+        Ok(received)
+    }
 }
 
 /// Serves published broker requests.

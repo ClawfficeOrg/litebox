@@ -27,8 +27,8 @@ pub mod kcall;
 #[cfg(target_os = "none")]
 pub mod start;
 pub mod thread;
+pub mod wait;
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use litebox::platform::page_mgmt::{
     AllocationError, DeallocationError, FixedAddressBehavior, HintPlacementBehavior,
     MemoryRegionPermissions, PermissionUpdateError,
@@ -45,10 +45,7 @@ use litebox_common_vm_abi::{
     LogLevel, Placement, Populate, Prot, RUNNER_MANAGED_MAX, RUNNER_MANAGED_MIN, StartupInfo,
     Status, WallClock,
 };
-use litebox_platform::sync::{
-    ImmediatelyWokenUp, RawMutex as RawMutexTrait, RawMutexProvider, UnblockedOrTimedOut,
-    WaitWakerProvider,
-};
+use litebox_platform::sync::{RawMutexProvider, WaitWakerProvider};
 use litebox_platform::time::{
     Instant as InstantTrait, SystemTime as SystemTimeTrait, TimeProvider,
 };
@@ -72,10 +69,7 @@ impl VmUserland {
     /// Panics if the TSC frequency is zero.
     pub fn new(info: &StartupInfo) -> Self {
         assert!(info.tsc_khz != 0, "TSC frequency must not be zero");
-        TIMED_WAIT.tsc_khz.store(info.tsc_khz, Ordering::Relaxed);
-        TIMED_WAIT
-            .control_ring
-            .store(info.broker_control_ring.start, Ordering::Relaxed);
+        wait::init(info);
         Self {
             tsc_khz: info.tsc_khz,
             wall_clock: info.wall_clock,
@@ -151,103 +145,10 @@ impl ArchSpecificProvider for VmUserland {
 }
 
 impl RawMutexProvider for VmUserland {
-    type RawMutex = RawMutex;
+    type RawMutex = wait::RawMutex;
 }
 
 impl WaitWakerProvider for VmUserland {}
-
-/// One thread: nothing else can change a waiter's word. So a wait with a
-/// timeout sleeps it out on the kernel's deadline wait, and one without
-/// panics, as nothing could end it.
-pub struct RawMutex {
-    inner: AtomicU32,
-}
-
-impl RawMutexTrait for RawMutex {
-    const INIT: Self = Self {
-        inner: AtomicU32::new(0),
-    };
-
-    fn underlying_atomic(&self) -> &AtomicU32 {
-        &self.inner
-    }
-
-    fn wake_many(&self, _n: usize) -> usize {
-        0
-    }
-
-    fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp> {
-        if self.inner.load(Ordering::Relaxed) != val {
-            return Err(ImmediatelyWokenUp);
-        }
-        panic!(
-            "blocking without a timeout in the single-threaded VM userland runner would deadlock"
-        )
-    }
-
-    fn block_or_timeout(
-        &self,
-        val: u32,
-        time: core::time::Duration,
-    ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
-        if self.inner.load(Ordering::Relaxed) != val {
-            return Err(ImmediatelyWokenUp);
-        }
-        TIMED_WAIT.sleep(time);
-        Ok(UnblockedOrTimedOut::TimedOut)
-    }
-}
-
-/// What [`RawMutex`] needs for timed waits, which get no platform reference;
-/// set by [`VmUserland::new`].
-struct TimedWait {
-    tsc_khz: AtomicU64,
-    /// [`StartupInfo::broker_control_ring`]'s start.
-    control_ring: AtomicU64,
-}
-
-static TIMED_WAIT: TimedWait = TimedWait {
-    tsc_khz: AtomicU64::new(0),
-    control_ring: AtomicU64::new(0),
-};
-
-impl TimedWait {
-    /// Halts for `time` with the kernel's deadline wait (`BrokerEnter`'s
-    /// Wait), on a control-ring word that only the kernel's serving changes:
-    /// the request ring's consumer epoch.
-    ///
-    /// # Panics
-    ///
-    /// If the kernel refuses the wait, e.g., before the broker handshake.
-    fn sleep(&self, time: core::time::Duration) {
-        use litebox_broker_transport::control_ring::ControlRingDirection;
-        let tsc_khz = self.tsc_khz.load(Ordering::Relaxed);
-        let ticks = u64::try_from(time.as_micros().saturating_mul(u128::from(tsc_khz)) / 1000)
-            .unwrap_or(u64::MAX);
-        let deadline = rdtsc().saturating_add(ticks);
-        let offset = ControlRingDirection::Requests.consumer_epoch_offset();
-        let word = usize::try_from(self.control_ring.load(Ordering::Relaxed))
-            .expect("x86-64 addresses fit usize")
-            + offset;
-        while rdtsc() < deadline {
-            // Safety: the control ring is mapped for the process's lifetime,
-            // and its words are aligned `u32`s.
-            let current = unsafe { (*(word as *const AtomicU32)).load(Ordering::Acquire) };
-            let request =
-                litebox_common_vm_abi::BrokerEnterRequest::wait(offset as u64, current, deadline);
-            match kcall::call(&request) {
-                // The word changed (served requests), or the deadline passed.
-                Ok(()) | Err(Status::TimedOut) => {}
-                Err(status) => panic!("timed wait: {status:?}"),
-            }
-        }
-    }
-}
-
-fn rdtsc() -> u64 {
-    // Safety: RDTSC has no side effects; the kernel allows it in ring 3.
-    unsafe { core::arch::x86_64::_rdtsc() }
-}
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Instant(u64);
@@ -261,14 +162,14 @@ impl TimeProvider for VmUserland {
     type SystemTime = SystemTime;
 
     fn now(&self) -> Instant {
-        Instant(self.tsc_to_nanos(rdtsc()))
+        Instant(self.tsc_to_nanos(wait::rdtsc()))
     }
 
     /// The kernel's wall clock ([`StartupInfo::wall_clock`]), advanced by the
     /// TSC: `time`, `gettimeofday`, and `CLOCK_REALTIME`.
     fn current_time(&self) -> SystemTime {
         let WallClock { unix_ns, tsc } = self.wall_clock;
-        SystemTime(unix_ns.saturating_add(self.tsc_to_nanos(rdtsc().saturating_sub(tsc))))
+        SystemTime(unix_ns.saturating_add(self.tsc_to_nanos(wait::rdtsc().saturating_sub(tsc))))
     }
 }
 
@@ -550,17 +451,6 @@ impl litebox::platform::GuestVectorStateProvider for VmUserland {
     }
 
     fn set_guest_vector_state(&self, _state: &Self::GuestVectorState) {}
-}
-
-/// No timers: the kernel delivers no asynchronous events to runners.
-impl litebox::platform::TimerProvider for VmUserland {
-    type TimerHandle = litebox::platform::trivial_providers::UnsupportedTimerHandle;
-    type Signal = litebox_common_linux::signal::Signal;
-}
-
-/// No asynchronous signals, as there are no timers.
-impl litebox::platform::SignalProvider for VmUserland {
-    type Signal = litebox_common_linux::signal::Signal;
 }
 
 /// Requires a shim KDF, which runs on a kernel-derived key bound to the

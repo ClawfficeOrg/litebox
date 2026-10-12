@@ -1,0 +1,4 @@
+[
+  { "argv": ["/alarm"], "expect_stdout": "pause: 1\nsyscalls: 1\nalarm: 1\nexpired then cancelled: 1\n" },
+  { "argv": ["/alarm", "default"], "expect_signal": 14 }
+]

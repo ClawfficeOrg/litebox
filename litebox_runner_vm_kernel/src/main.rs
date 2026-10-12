@@ -44,6 +44,7 @@ fn kernel_main(kernel: Kernel) -> ! {
             console,
             events: devices,
             root: payload.file("rootfs.tar"),
+            clock: kernel.clock,
         })
     };
     if let Some(programs) = payload.file("programs.json") {
