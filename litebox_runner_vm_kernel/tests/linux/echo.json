@@ -1,0 +1,3 @@
+[
+  { "argv": ["/echo"], "expect_stdout": "hello from the host\n" }
+]
