@@ -23,8 +23,9 @@ use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
 use litebox::process::ProcessError;
 use litebox::{shim::Exception, sync::Mutex, utils::ReinterpretUnsignedExt as _};
-use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::process::ProcessExitStatus;
+use litebox_broker_protocol::signal::SignalTarget;
+use litebox_broker_protocol::{ProcessGroupId, ProcessId};
 use litebox_common_linux::signal::{
     CLD_EXITED, CLD_KILLED, FPE_INTDIV, ILL_ILLOPN, MINSIGSTKSZ, NSIG, SI_KERNEL, SI_USER, SIG_DFL,
     SIG_IGN, SaFlags, SigAction, SigAltStack, SigSet, Siginfo, SiginfoData, SigmaskHow, Signal,
@@ -752,10 +753,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
         if signal == Signal::SIGCHLD && act.is_some() {
             // Linux decides whether to send `SIGCHLD` as the child terminates, so terminations
-            // already notified to this process are observed under the old action. A termination
+            // already notified to this process are taken under the old action. A termination
             // concurrent with this call, or not yet notified, which the guest cannot tell apart,
             // may still be reaped under the old action and signaled under the new one.
-            let _ = self.observe_child_terminations();
+            self.take_signals(false);
         }
 
         let handlers = self.signals.handlers.borrow();
@@ -790,11 +791,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Ok(0)
     }
 
-    /// Sets whether the broker reaps this process's children as they terminate.
+    /// Sets whether this process's children are reaped as they terminate, by having the broker
+    /// discard their exits rather than retain them.
     pub(crate) fn set_child_reaping(&self, enabled: bool) {
         // Failure means the process service is unavailable or has failed, so no child can be
         // created or observed.
-        let _ = self.global.litebox.set_child_reaping(enabled);
+        let _ = self.global.litebox.set_child_exit_retention(!enabled);
     }
 
     pub(crate) fn sys_kill(&self, pid: i32, signal: i32) -> Result<usize, Errno> {
@@ -816,27 +818,67 @@ impl<Platform: ShimPlatform> Task<Platform> {
         } else {
             Some(Signal::try_from(signal)?)
         };
+        // Like Linux, `kill` given the ID of any of this process's threads signals this process.
+        let pid = match (pid, tid) {
+            (Some(pid), None) if self.process().has_thread(pid) => Some(self.pid),
+            _ => pid,
+        };
         if pid.is_none_or(|pid| pid == self.pid) && tid.is_none_or(|tid| tid == self.tid()) {
             if let Some(signal) = signal {
-                self.send_signal(signal, siginfo_kill(signal));
+                // `kill` directs the signal to the process, so any of its threads not blocking
+                // the signal may take it, while `tkill` and `tgkill` direct it to this thread.
+                if tid.is_none() {
+                    self.send_shared_signal(signal, siginfo_kill(signal));
+                } else {
+                    self.send_signal(signal, siginfo_kill(signal));
+                }
             }
             Ok(0)
-        } else if let (Some(pid @ 1..), None) = (pid, tid) {
-            let signal = signal.map_or(0, |signal| signal.as_i32().cast_unsigned());
-            match self
-                .global
-                .litebox
-                .send_signal(ProcessId(pid.cast_unsigned()), signal)
-            {
-                Ok(()) => Ok(0),
-                // Without a process service, no other process exists.
-                Err(ProcessError::Unavailable) => Err(Errno::ESRCH),
-                Err(error) => Err(error.into()),
-            }
+        } else if let (Some(pid), None) = (pid, tid) {
+            self.kill_processes(pid, signal)
         } else {
             log_unsupported!("sys_{{t|tg}}kill with remote pid/tid");
             Err(Errno::ESRCH)
         }
+    }
+
+    /// Sends `signal` to the processes `kill` selects with `pid`, other than this process alone.
+    fn kill_processes(&self, pid: i32, signal: Option<Signal>) -> Result<usize, Errno> {
+        let target = match pid {
+            1.. => SignalTarget::Process(ProcessId(pid.cast_unsigned())),
+            0 => SignalTarget::ProcessGroup(
+                self.global
+                    .litebox
+                    .process_info(ProcessId(self.pid.cast_unsigned()))?
+                    .membership
+                    .process_group,
+            ),
+            -1 => SignalTarget::All,
+            i32::MIN => return Err(Errno::ESRCH),
+            _ => SignalTarget::ProcessGroup(ProcessGroupId(pid.unsigned_abs())),
+        };
+        let number = signal.map_or(0, |signal| signal.as_i32().cast_unsigned());
+        let litebox = &self.global.litebox;
+        let result = match litebox.send_signal(target, number) {
+            // Like Linux, the ID of any of a process's threads selects the process.
+            Err(ProcessError::NoSuchProcess) if matches!(target, SignalTarget::Process(_)) => self
+                .thread_owner(pid)
+                .and_then(|owner| litebox.send_signal(SignalTarget::Process(owner), number)),
+            result => result,
+        };
+        match result {
+            Ok(()) => {}
+            // Without a process service, no other process exists.
+            Err(ProcessError::Unavailable) if matches!(target, SignalTarget::Process(_)) => {
+                return Err(Errno::ESRCH);
+            }
+            Err(error) => return Err(error.into()),
+        }
+        // The group may include this process.
+        if signal.is_some() && matches!(target, SignalTarget::ProcessGroup(_)) {
+            self.take_signals(true);
+        }
+        Ok(0)
     }
 
     /// Returns whether there are any pending signals that can be delivered.

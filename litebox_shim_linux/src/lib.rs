@@ -432,7 +432,6 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
     ) -> Result<LoadedProgram<Platform>, loader::elf::ElfLoaderError> {
         let litebox_common_linux::TaskParams {
             pid,
-            ppid,
             uid,
             euid,
             gid,
@@ -443,7 +442,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             cwd,
             umask,
         } = task;
-        if pid != self.0.process_id || ppid < 0 {
+        if pid != self.0.process_id {
             return Err(loader::elf::ElfLoaderError::InvalidProcessId);
         }
 
@@ -480,12 +479,11 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             _not_send: core::marker::PhantomData,
             task: Task {
                 global: self.0.clone(),
-                litebox_thread: Cell::new(Some(initial_thread)),
-                thread: syscalls::process::ThreadState::new_process(pid),
+                litebox_thread: Cell::new(None),
+                thread: syscalls::process::ThreadState::new_process(pid, Some(initial_thread)),
                 wait_state: wait::WaitState::new(self.0.platform),
                 vfork: RefCell::new(None),
                 pid,
-                ppid,
                 credentials,
                 comm: [0; litebox_common_linux::TASK_COMM_LEN].into(), // set at load time
                 fs: fs_state.into(),
@@ -498,6 +496,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
         if entrypoints.task.signals.reaps_children() {
             entrypoints.task.set_child_reaping(true);
         }
+        entrypoints.task.adopt_orphans_if_first();
         entrypoints.task.open_signals();
 
         let (path, argv) = entrypoints
@@ -533,7 +532,6 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
         load_image: impl FnMut(u64, &mut [u8]) -> Result<(), Errno>,
     ) -> Result<LoadedProgram<Platform>, ForkRestoreError> {
         let litebox_common_linux::program_startup::LinuxForkStartup {
-            parent_process_id,
             uid,
             euid,
             gid,
@@ -582,7 +580,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             .map_err(ForkRestoreError::WorkingDirectory)?;
         fs_state.set_umask(umask);
 
-        let thread = syscalls::process::ThreadState::new_process(pid);
+        let thread = syscalls::process::ThreadState::new_process(pid, Some(initial_thread));
         thread.set_forked_init_state(
             registers,
             vector_state,
@@ -594,12 +592,11 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             _not_send: core::marker::PhantomData,
             task: Task {
                 global: self.0.clone(),
-                litebox_thread: Cell::new(Some(initial_thread)),
+                litebox_thread: Cell::new(None),
                 thread,
                 wait_state: wait::WaitState::new(self.0.platform),
                 vfork: RefCell::new(None),
                 pid,
-                ppid: parent_process_id,
                 credentials,
                 comm: comm.into(),
                 fs: Arc::new(fs_state).into(),
@@ -862,8 +859,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let syscall_number = ctx.syscallno.cast_unsigned() as usize;
         let request = SyscallRequest::try_from_raw(syscall_number, ctx, log_unsupported_fmt);
         // The constrained vfork child may only inspect its temporary identity and resource limits,
-        // manage its own signal state, descriptors, working directory, and umask, open and write
-        // files, exit, or attempt execve. Any other syscall terminates the shared runner.
+        // manage its own process group and session, signal state, descriptors, working directory,
+        // and umask, open and write files, exit, or attempt execve. Any other syscall terminates
+        // the shared runner.
         let is_vfork_child = self.vfork.borrow().is_some();
         if is_vfork_child
             && !matches!(
@@ -874,6 +872,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     | SyscallRequest::Getpid
                     | SyscallRequest::Getppid
                     | SyscallRequest::Gettid
+                    | SyscallRequest::Setpgid { .. }
+                    | SyscallRequest::Getpgid { .. }
+                    | SyscallRequest::Getpgrp
+                    | SyscallRequest::Setsid
+                    | SyscallRequest::Getsid { .. }
                     | SyscallRequest::Prlimit {
                         pid: 0,
                         new_limit: None,
@@ -1444,6 +1447,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
             } => self.sys_wait4(pid, wstatus, options, rusage),
             SyscallRequest::Getpid => Ok(self.sys_getpid().reinterpret_as_unsigned() as usize),
             SyscallRequest::Getppid => Ok(self.sys_getppid().reinterpret_as_unsigned() as usize),
+            SyscallRequest::Setpgid { pid, pgid } => self.sys_setpgid(pid, pgid),
+            SyscallRequest::Getpgid { pid } => self.sys_getpgid(pid),
+            SyscallRequest::Getpgrp => self.sys_getpgrp(),
+            SyscallRequest::Setsid => self.sys_setsid(),
+            SyscallRequest::Getsid { pid } => self.sys_getsid(pid),
             SyscallRequest::Getuid => Ok(self.sys_getuid() as usize),
             SyscallRequest::Getgid => Ok(self.sys_getgid() as usize),
             SyscallRequest::Geteuid => Ok(self.sys_geteuid() as usize),
@@ -1527,14 +1535,14 @@ struct GlobalState<Platform: ShimPlatform> {
 
 struct Task<Platform: ShimPlatform> {
     global: Arc<GlobalState<Platform>>,
+    /// The broker thread whose ID is this task's thread ID. The main thread has none, since its
+    /// thread ID is the process ID.
     litebox_thread: Cell<Option<litebox::thread::Thread>>,
     wait_state: wait::WaitState<Platform>,
     thread: syscalls::process::ThreadState<Platform>,
     vfork: RefCell<Option<VforkState<Platform>>>,
     /// Process ID
     pid: i32,
-    /// Parent Process ID
-    ppid: i32,
     /// Task credentials. These are set per task but are Arc'd to save space
     /// since most tasks never change their credentials.
     credentials: Arc<syscalls::process::Credentials>,
@@ -1549,7 +1557,7 @@ struct Task<Platform: ShimPlatform> {
 }
 
 struct VforkState<Platform: ShimPlatform> {
-    child: litebox::process::Process<Platform>,
+    child: litebox::process::PendingChild,
     child_pid: i32,
     parent_context: litebox_common_linux::PtRegs,
     /// The parent's floating-point and vector state, which the child may change.
@@ -1611,10 +1619,9 @@ mod test_utils {
             Task {
                 wait_state: wait::WaitState::new(self.platform),
                 litebox_thread: Cell::new(None),
-                thread: syscalls::process::ThreadState::new_process(pid),
+                thread: syscalls::process::ThreadState::new_process(pid, None),
                 vfork: RefCell::new(None),
                 pid,
-                ppid: 0,
                 credentials,
                 comm: Cell::new(*b"test\0\0\0\0\0\0\0\0\0\0\0\0"),
                 fs: fs_state.into(),
@@ -1642,7 +1649,6 @@ mod test_utils {
                 thread,
                 vfork: RefCell::new(None),
                 pid: self.pid,
-                ppid: self.ppid,
                 credentials: self.credentials.clone(),
                 comm: self.comm.clone(),
                 fs: self.fs.clone(),

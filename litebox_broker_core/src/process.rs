@@ -10,6 +10,7 @@ use core::any::Any;
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+use crate::id::IdAllocator;
 use crate::object::{self, ObjectEntry, ObjectReference, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink};
 use crate::signal::ProcessSignals;
@@ -17,8 +18,9 @@ use crate::{BrokerCore, BrokerError, Result};
 use hashbrown::{HashMap, HashSet};
 use litebox_broker_protocol::fs::{FileOpenFlags, FileStatusFlags, SetStatusFlagsRequest};
 use litebox_broker_protocol::process::{
-    CreatedProcess, ProcessExitStatus, ProcessIdentity, ProcessTermination,
+    ChildExit, ChildSelector, ProcessExitStatus, ProcessIdentity, ProcessInfo, ThreadInfo,
 };
+use litebox_broker_protocol::process_group::ProcessGroupMembership;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
 use spin::{Mutex, Once, rwlock::RwLock};
@@ -148,58 +150,18 @@ impl AssociationCancellation {
     }
 }
 
-impl ObjectEntry {
-    fn as_process(&self) -> Result<&ProcessObject> {
-        match self {
-            Self::Process(process) => Ok(process),
-            _ => Err(BrokerError::InvalidRights),
-        }
-    }
-}
-
-/// Reference to one process.
-///
-/// The reference keeps the process's exit status available until it closes.
-pub(crate) struct ProcessObject {
-    process: Arc<BrokerProcess>,
-    readiness: ReadinessRegistration,
-}
-
-impl ProcessObject {
-    pub(crate) fn readiness(&self) -> ReadinessFlags {
-        if self.process.state.lock().status.is_terminated() {
-            ReadinessFlags::READ
-        } else {
-            ReadinessFlags::default()
-        }
-    }
-
-    fn termination(&self) -> Result<ProcessTermination> {
-        let state = self.process.state.lock();
-        let exit_status = match state.status {
-            ProcessStatus::Starting | ProcessStatus::Running | ProcessStatus::Exiting => {
-                return Err(BrokerError::WouldBlock);
-            }
-            ProcessStatus::Failed(_) => ProcessExitStatus::Unknown,
-            ProcessStatus::Zombie(status) => status,
-        };
-        Ok(ProcessTermination {
-            exit_status,
-            reaped: state.reaped,
-        })
-    }
-}
-
-impl Drop for ProcessObject {
-    fn drop(&mut self) {
-        // The child may still hold a registration clone for exit publication.
-        self.readiness.retire();
-    }
-}
-
 struct ProcessReferences {
     handles: Vec<ObjectHandle>,
     pending_handles: usize,
+}
+
+/// Broker-owned state for one guest thread.
+#[derive(Clone, Copy)]
+pub(crate) struct BrokerThread {
+    /// Process that owns this thread.
+    process_id: ProcessId,
+    /// Whether this is its process's initial thread.
+    initial: bool,
 }
 
 /// Broker-owned state for one authenticated guest process.
@@ -213,10 +175,13 @@ pub struct BrokerProcess {
     pub(crate) id: ProcessId,
     /// ID assigned to the initial thread when process creation completes.
     initial_thread_id: Once<ThreadId>,
-    /// Creating parent process.
-    parent: Option<Weak<BrokerProcess>>,
-    /// Whether this process's children are reaped when they terminate.
-    reap_children: AtomicBool,
+    /// Process that created this one, if any.
+    creator: Option<ProcessId>,
+    /// This process's place in the process tree.
+    ///
+    /// No other lock is taken while this one is held. Changes are serialized
+    /// by the core's process tree lock.
+    tree_node: Mutex<ProcessTreeNode>,
     state: Mutex<BrokerProcessState>,
     /// Broker-entry-authenticated caller credential for this process.
     pub(crate) caller_credential: CallerCredential,
@@ -228,25 +193,45 @@ pub struct BrokerProcess {
     pub(crate) reserved_pipe_capacity: Arc<AtomicUsize>,
     /// Socket quota held by pending, live, and closing in-flight resources.
     pub(crate) reserved_sockets: Arc<AtomicUsize>,
-    /// Signals sent to this process that it has not taken.
+    /// Signals and child exits this process has not taken.
     pub(crate) signals: Arc<ProcessSignals>,
     /// Cancellation state of this process's association.
     pub(crate) cancellation: AssociationCancellation,
+}
+
+/// A process's place in the process tree.
+struct ProcessTreeNode {
+    /// Process group and session.
+    membership: ProcessGroupMembership,
+    /// Process that collects this one's exit, if any.
+    ///
+    /// This starts as the creator. Once the parent exits, it becomes the
+    /// nearest running ancestor that adopts orphans, or none.
+    parent: Option<Weak<BrokerProcess>>,
+    /// Children whose exits are not yet collected, in the order this process
+    /// gained them.
+    ///
+    /// Each keeps its child, and thus an exited child's exit status, alive.
+    children: Vec<Arc<BrokerProcess>>,
+    /// Whether children's exits are retained until collected, rather than
+    /// discarded as soon as they exit.
+    retain_child_exits: bool,
+    /// Whether this process adopts the orphaned children of its exiting
+    /// descendants.
+    adopts_orphans: bool,
+    /// Exit status, once this process exited.
+    exit_status: Option<ProcessExitStatus>,
+    /// Whether this process no longer exists for other processes, because its
+    /// exit was collected or discarded, or it never started.
+    released: bool,
 }
 
 struct BrokerProcessState {
     status: ProcessStatus,
     /// Final termination status reported by the running process.
     reported_exit_status: Option<ProcessExitStatus>,
-    /// Whether this process was reaped when it terminated, so its handles
-    /// observe termination without a status.
-    reaped: bool,
-    /// Parent handle readiness published once this process terminates.
-    exit_readiness: Option<ReadinessRegistration>,
     /// Child retained until this process requests startup.
     pending_child_process: Option<PendingChild>,
-    /// Whether a starting child continues after its parent dies.
-    continue_startup_on_parent_death: bool,
     retirement: ProcessRetirement,
     shutdown_request: ProcessShutdownRequest,
     shutdown: Option<ProcessShutdown>,
@@ -272,34 +257,22 @@ pub(crate) enum ProcessStatus {
     /// Startup failed and host cleanup is still pending.
     Failed(BrokerError),
     /// The process exited and retains its exit status.
-    Zombie(ProcessExitStatus),
+    Exited(ProcessExitStatus),
 }
 
 impl ProcessStatus {
-    const fn is_terminated(self) -> bool {
-        matches!(self, Self::Failed(_) | Self::Zombie(_))
-    }
-
     fn transition(&mut self, next: Self) -> Result<()> {
         let allowed = matches!(
             (*self, next),
             (Self::Starting, Self::Running | Self::Failed(_))
                 | (Self::Starting | Self::Running, Self::Exiting)
-                | (Self::Exiting, Self::Zombie(_))
+                | (Self::Exiting, Self::Exited(_))
         );
         if !allowed {
             return Err(BrokerError::Internal);
         }
         *self = next;
         Ok(())
-    }
-}
-
-fn publish_exit_readiness(readiness: Option<ReadinessRegistration>) {
-    if let Some(readiness) = readiness {
-        // The association readiness budget reserves capacity for every child
-        // handle, so publication fails only after the association closes.
-        let _ = readiness.publish(ReadinessFlags::READ);
     }
 }
 
@@ -339,26 +312,42 @@ enum ProcessShutdownRequest {
 }
 
 impl BrokerProcess {
-    /// Creates authenticated broker process state.
+    /// Creates authenticated broker process state for the allocated ID `id`.
+    ///
+    /// A child of `creator` starts in its group and session, while a root
+    /// process leads its own.
     pub(crate) fn new(
         core: BrokerCore,
         id: ProcessId,
-        parent: Option<Weak<BrokerProcess>>,
+        creator: Option<&Arc<BrokerProcess>>,
         caller_credential: CallerCredential,
     ) -> Self {
+        let membership = creator.map_or(
+            ProcessGroupMembership {
+                process_group: id.into(),
+                session: id.into(),
+            },
+            |creator| creator.membership(),
+        );
+        Self::retain_membership_ids(&mut core.ids.lock(), membership);
         Self {
             core,
             id,
             initial_thread_id: Once::new(),
-            parent,
-            reap_children: AtomicBool::new(false),
+            creator: creator.map(|creator| creator.id),
+            tree_node: Mutex::new(ProcessTreeNode {
+                membership,
+                parent: creator.map(Arc::downgrade),
+                children: Vec::new(),
+                retain_child_exits: true,
+                adopts_orphans: false,
+                exit_status: None,
+                released: false,
+            }),
             state: Mutex::new(BrokerProcessState {
                 status: ProcessStatus::Starting,
                 reported_exit_status: None,
-                reaped: false,
-                exit_readiness: None,
                 pending_child_process: None,
-                continue_startup_on_parent_death: false,
                 retirement: ProcessRetirement::Active { abnormal: false },
                 shutdown_request: ProcessShutdownRequest::None,
                 shutdown: None,
@@ -399,12 +388,20 @@ impl BrokerProcess {
             .expect("broker process creation did not initialize its initial thread ID")
     }
 
-    pub(crate) fn set_initial_thread_id(&self, initial_thread_id: ThreadId) {
+    /// Creates this process's initial thread.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called twice, or if the shared ID allocator violates its
+    /// range or uniqueness invariants.
+    pub(crate) fn create_initial_thread(&self) -> Result<()> {
         assert!(
             self.initial_thread_id.get().is_none(),
-            "broker process initial thread ID was initialized twice"
+            "broker process initial thread was created twice"
         );
-        self.initial_thread_id.call_once(|| initial_thread_id);
+        let thread_id = self.add_thread(true)?;
+        self.initial_thread_id.call_once(|| thread_id);
+        Ok(())
     }
 
     /// Returns the credential authenticated for this process association.
@@ -413,42 +410,11 @@ impl BrokerProcess {
         self.caller_credential
     }
 
-    /// Prepares a newly created child for duplication startup.
-    ///
-    /// The child must have been created directly from this running process.
-    /// Holding the parent state lock while marking the child ensures parent
-    /// death either rejects ordinary startup or lets prepared startup continue.
-    pub fn prepare_duplication_child(&self, child: &BrokerProcess) -> Result<()> {
-        if !self.core.policy.process_duplication_enabled() {
-            return Err(BrokerError::PolicyDenied);
-        }
-        if core::ptr::eq(self, child) || !Arc::ptr_eq(&self.core.processes, &child.core.processes) {
-            return Err(BrokerError::Internal);
-        }
-
-        let state = self.state.lock();
-        if !self.accepts_operations(&state) {
-            return Err(BrokerError::PeerClosed);
-        }
-        let mut child_state = child.state.lock();
-        if !child.awaits_startup(&child_state)
-            || !child.is_child_of(self)
-            || child_state.continue_startup_on_parent_death
-        {
-            return Err(BrokerError::Internal);
-        }
-        child_state.continue_startup_on_parent_death = true;
-        Ok(())
-    }
-
     /// Allocates and retains one pending child process.
     ///
-    /// The returned parent-owned handle publishes readiness through
-    /// `readiness_sink` once the child terminates.
-    pub fn allocate_child_process(
-        &self,
-        readiness_sink: Arc<dyn ReadinessSink>,
-    ) -> Result<CreatedProcess> {
+    /// The child is this process's child from the start, so its exit is
+    /// reported here even if it exits before starting its own runner.
+    pub fn allocate_child_process(&self) -> Result<ProcessIdentity> {
         if !self.core.policy.process_duplication_enabled() {
             return Err(BrokerError::PolicyDenied);
         }
@@ -462,7 +428,9 @@ impl BrokerProcess {
             }
         }
 
-        let (child, handle) = self.create_child_process(readiness_sink)?;
+        let child = self
+            .core
+            .create_process(self.caller_credential, Some(self.id))?;
         let result = {
             let mut state = self.state.lock();
             if !self.accepts_operations(&state) {
@@ -479,60 +447,24 @@ impl BrokerProcess {
                         process: Arc::clone(&child),
                         image: None,
                     });
-                    Ok(CreatedProcess {
-                        identity: ProcessIdentity {
-                            process_id: child.id(),
-                            initial_thread_id: child.initial_thread_id(),
-                        },
-                        handle,
+                    Ok(ProcessIdentity {
+                        process_id: child.id(),
+                        initial_thread_id: child.initial_thread_id(),
                     })
                 }
             }
         };
-        if let Err(error) = result {
-            child.retire(true);
-            return Err(self
-                .close_object_reference(handle)
-                .map_or(BrokerError::Internal, |()| error));
+        if result.is_err() {
+            child.discard();
         }
         result
     }
 
-    /// Creates a child process and the parent-owned handle that observes its
-    /// termination.
-    ///
-    /// The handle publishes readiness through `readiness_sink` once the child
-    /// terminates, and keeps the child's exit status available until it
-    /// closes. The child is retired if handle creation fails.
-    fn create_child_process(
-        &self,
-        readiness_sink: Arc<dyn ReadinessSink>,
-    ) -> Result<(Arc<BrokerProcess>, ObjectHandle)> {
-        let rights = self
-            .core
-            .policy
-            .principal_object_rights(self.caller_credential)?;
-        let reference = self.reserve_object_reference(rights)?;
-        let child = self
-            .core
-            .create_process(self.caller_credential, Some(self.id))?;
-        let readiness = ReadinessRegistration::new_with_retirement_guard(
-            reference.handle(),
-            readiness_sink,
-            Arc::new(()),
-        );
-        child.state.lock().exit_readiness = Some(readiness.clone());
-        let object = ProcessObject {
-            process: Arc::clone(&child),
-            readiness,
-        };
-        match reference.commit(ObjectEntry::Process(object)) {
-            Ok(handle) => Ok((child, handle)),
-            Err(error) => {
-                child.retire(true);
-                Err(error)
-            }
-        }
+    /// Discards a child that never started, as if it had never been created,
+    /// except that its parent learns it was removed.
+    fn discard(&self) {
+        let _ = self.fail_start(BrokerError::PeerClosed, false, true);
+        self.retire(true);
     }
 
     /// Takes the pending child selected for startup.
@@ -616,9 +548,8 @@ impl BrokerProcess {
     /// Records the exit of the pending child selected by `child_process_id`.
     ///
     /// A child may run in this process's runner before starting its own, as a
-    /// Linux `vfork` child does until `execve`. If it exits there, it becomes
-    /// a zombie retaining `exit_status`, like a started child after
-    /// [`Self::complete_exit`].
+    /// Linux `vfork` child does until `execve`. If it exits there, it retains
+    /// `exit_status`, like a started child after [`Self::complete_exit`].
     pub fn exit_child_process(
         &self,
         child_process_id: ProcessId,
@@ -642,6 +573,14 @@ impl BrokerProcess {
         child.finish_exit(exit_status, release_thread_ids)
     }
 
+    /// Discards the pending child selected by `child_process_id`, as if it
+    /// had never been created, except that this process learns it was
+    /// removed.
+    pub fn cancel_child_process(&self, child_process_id: ProcessId) -> Result<()> {
+        self.take_child_process(child_process_id)?.discard();
+        Ok(())
+    }
+
     /// Records the final termination status reported by this running process.
     ///
     /// A runner observes its guest's termination more precisely than its host
@@ -656,19 +595,115 @@ impl BrokerProcess {
         Ok(())
     }
 
-    /// Sets whether this running process's children are reaped when they
-    /// terminate.
+    /// Sets whether this running process retains its children's exits until
+    /// it collects them, rather than discarding each as soon as the child
+    /// exits.
     ///
-    /// Like Linux `SIGCHLD` auto-reaping, each child applies the setting in
-    /// effect when it terminates, so children that already terminated keep
-    /// their status.
-    pub fn set_child_reaping(&self, enabled: bool) -> Result<()> {
-        let state = self.state.lock();
-        if !self.accepts_operations(&state) {
+    /// Each child applies the setting in effect when it exits, so exits
+    /// already retained are kept until collected.
+    pub fn set_child_exit_retention(&self, enabled: bool) -> Result<()> {
+        self.update_tree_node(|node| node.retain_child_exits = enabled)
+    }
+
+    /// Sets whether this running process adopts the orphaned children of its
+    /// exiting descendants.
+    ///
+    /// When a process exits, its children move to its nearest running ancestor
+    /// that adopts orphans. Without one, they have no parent, and their exits
+    /// are discarded as soon as they exit.
+    pub fn set_orphan_adoption(&self, enabled: bool) -> Result<()> {
+        self.update_tree_node(|node| node.adopts_orphans = enabled)
+    }
+
+    /// Updates this running process's place in the process tree.
+    fn update_tree_node(&self, update: impl FnOnce(&mut ProcessTreeNode)) -> Result<()> {
+        let _tree = self.core.process_tree_lock.lock();
+        if !self.accepts_operations(&self.state.lock()) {
             return Err(BrokerError::PeerClosed);
         }
-        self.reap_children.store(enabled, Ordering::SeqCst);
+        update(&mut self.tree_node.lock());
         Ok(())
+    }
+
+    /// Collects the exit of this running process's oldest exited child that
+    /// `selector` matches, removing the child from the process tree.
+    ///
+    /// Returns `WouldBlock` if only live children match, and `UnknownObject`
+    /// if none does. Each matching child's exit or removal is then posted to
+    /// this process's signals.
+    pub fn collect_child_exit(&self, selector: ChildSelector) -> Result<ChildExit> {
+        let _tree = self.core.process_tree_lock.lock();
+        if !self.accepts_operations(&self.state.lock()) {
+            return Err(BrokerError::PeerClosed);
+        }
+        // This process's node lock is released while its children's are read,
+        // since no other lock is taken while one is held.
+        let mut children = core::mem::take(&mut self.tree_node.lock().children);
+        let mut matched = false;
+        let exited = children.iter().position(|child| {
+            let node = child.tree_node.lock();
+            let selected = match selector {
+                ChildSelector::Any => true,
+                ChildSelector::Process(id) => child.id == id,
+                ChildSelector::ProcessGroup(id) => node.membership.process_group == id,
+            };
+            matched |= selected;
+            selected && node.exit_status.is_some()
+        });
+        let collected = exited.map(|index| children.remove(index));
+        self.tree_node.lock().children = children;
+        let Some(child) = collected else {
+            return Err(if matched {
+                BrokerError::WouldBlock
+            } else {
+                BrokerError::UnknownObject
+            });
+        };
+        let mut node = child.tree_node.lock();
+        node.released = true;
+        Ok(ChildExit {
+            process_id: child.id,
+            exit_status: node.exit_status.ok_or(BrokerError::Internal)?,
+        })
+    }
+
+    /// Returns the place in the process tree of the process `target`.
+    ///
+    /// Returns `UnknownObject` if no such process exists.
+    pub fn process_info(&self, target: ProcessId) -> Result<ProcessInfo> {
+        let target = self.core.registered_process(target)?;
+        // While the node references a parent, it has yet to finish exiting,
+        // so it is still registered; once an adoption replaces it, its exit
+        // may be collected. Upgrade it under the node's lock, and drop it only
+        // after releasing that lock.
+        let (parent, membership) = {
+            let node = target.tree_node.lock();
+            (
+                node.parent.as_ref().and_then(Weak::upgrade),
+                node.membership,
+            )
+        };
+        Ok(ProcessInfo {
+            creator: target.creator,
+            parent: parent.as_ref().map(|parent| parent.id),
+            membership,
+        })
+    }
+
+    /// Returns the process the thread `target` belongs to.
+    ///
+    /// Returns `UnknownObject` if no such thread exists.
+    pub fn thread_info(&self, target: ThreadId) -> Result<ThreadInfo> {
+        let thread = *self
+            .core
+            .threads
+            .read()
+            .get(&target)
+            .ok_or(BrokerError::UnknownObject)?;
+        Ok(ThreadInfo {
+            process_id: thread.process_id,
+            initial: thread.initial,
+        })
     }
 
     /// Duplicates object references into the pending child selected by
@@ -709,22 +744,76 @@ impl BrokerProcess {
         self.duplicate_object_references_to(handles, child)
     }
 
-    /// Returns this process's parent if it still exists.
-    ///
-    /// Callers upgrade before taking this process's state lock and drop the
-    /// parent after releasing it, since the last parent reference may run
-    /// its teardown.
-    fn live_parent(&self) -> Option<Arc<BrokerProcess>> {
-        self.parent.as_ref().and_then(Weak::upgrade)
+    /// Returns this process's group and session.
+    pub(crate) fn membership(&self) -> ProcessGroupMembership {
+        self.tree_node.lock().membership
     }
 
-    /// Records whether this terminating process is reaped.
+    /// Moves this process into another group or session.
     ///
-    /// Callers hold this process's state lock across the terminal status
-    /// transition, so a parent that observes this process live before changing
-    /// its reaping setting also observes this termination apply that setting.
-    fn record_reaping(state: &mut BrokerProcessState, parent: Option<&BrokerProcess>) {
-        state.reaped = parent.is_some_and(|parent| parent.reap_children.load(Ordering::SeqCst));
+    /// Callers hold the core's process tree lock.
+    pub(crate) fn set_membership(&self, membership: ProcessGroupMembership) {
+        let mut ids = self.core.ids.lock();
+        Self::retain_membership_ids(&mut ids, membership);
+        let previous = core::mem::replace(&mut self.tree_node.lock().membership, membership);
+        Self::release_membership_ids(&mut ids, previous);
+    }
+
+    /// Keeps the IDs of the group and session in `membership` from being
+    /// reused while a process belongs to them, as Linux keeps a PID in use as
+    /// a process group or session ID.
+    fn retain_membership_ids(ids: &mut IdAllocator, membership: ProcessGroupMembership) {
+        ids.retain(membership.process_group.0);
+        ids.retain(membership.session.0);
+    }
+
+    /// Releases the IDs that [`Self::retain_membership_ids`] retained.
+    fn release_membership_ids(ids: &mut IdAllocator, membership: ProcessGroupMembership) {
+        ids.release(membership.process_group.0);
+        ids.release(membership.session.0);
+    }
+
+    /// Returns whether another process created this one.
+    pub(crate) const fn has_creator(&self) -> bool {
+        self.creator.is_some()
+    }
+
+    /// Returns whether this process's exit was collected or discarded, or it
+    /// never started, so it no longer exists for other processes.
+    pub(crate) fn is_released(&self) -> bool {
+        self.tree_node.lock().released
+    }
+
+    /// Reserves room for one more child.
+    ///
+    /// Callers hold the core's process tree lock.
+    pub(crate) fn reserve_child(&self) -> Result<()> {
+        self.tree_node
+            .lock()
+            .children
+            .try_reserve(1)
+            .map_err(|_| BrokerError::OutOfMemory)
+    }
+
+    /// Adds a newly created child, for which [`Self::reserve_child`] made
+    /// room.
+    ///
+    /// Callers hold the core's process tree lock.
+    pub(crate) fn add_child(&self, child: Arc<BrokerProcess>) {
+        self.tree_node.lock().children.push(child);
+    }
+
+    /// Calls `f` with the pending child selected by `child_process_id`, which
+    /// stays pending until `f` returns.
+    pub(crate) fn with_pending_child<R>(
+        &self,
+        child_process_id: ProcessId,
+        f: impl FnOnce(&Arc<BrokerProcess>) -> R,
+    ) -> Result<R> {
+        let mut state = self.state.lock();
+        Ok(f(&self
+            .pending_child(&mut state, child_process_id)?
+            .process))
     }
 
     /// Returns whether this process completed broker startup.
@@ -741,7 +830,7 @@ impl BrokerProcess {
             ProcessStatus::Starting => None,
             // A process exits only after it runs, possibly before starting its
             // own runner.
-            ProcessStatus::Running | ProcessStatus::Exiting | ProcessStatus::Zombie(_) => {
+            ProcessStatus::Running | ProcessStatus::Exiting | ProcessStatus::Exited(_) => {
                 Some(Ok(()))
             }
             ProcessStatus::Failed(error) => Some(Err(error)),
@@ -759,12 +848,11 @@ impl BrokerProcess {
                 ProcessStatus::Starting => {}
                 ProcessStatus::Running => return Err(BrokerError::Internal),
                 ProcessStatus::Failed(error) => return Err(error),
-                ProcessStatus::Exiting | ProcessStatus::Zombie(_) => {
+                ProcessStatus::Exiting | ProcessStatus::Exited(_) => {
                     return Err(BrokerError::PeerClosed);
                 }
             }
             state.status.transition(ProcessStatus::Running)?;
-            state.continue_startup_on_parent_death = false;
         }
         self.core.process_lifecycle_sink.changed();
         Ok(())
@@ -773,11 +861,12 @@ impl BrokerProcess {
     /// Publishes one runner termination outcome.
     ///
     /// Exit releases object references, socket state, and, after clean
-    /// retirement, thread IDs. A zombie keeps only its process ID, registry
-    /// entry, and exit status, and remains until its parent's process handle
-    /// and runner supervision release it. The parent's handle becomes
-    /// readable. Only the first completion releases resources and records its
-    /// status; later or concurrent completions return without effect.
+    /// retirement, thread IDs. An exited process keeps only its process ID,
+    /// group and session, registry entry, and exit status, and remains until
+    /// its exit is collected or discarded and runner supervision releases it.
+    /// Only the first completion releases
+    /// resources and records its status; later or concurrent completions
+    /// return without effect.
     ///
     /// A status reported through [`Self::report_exit_status`] takes precedence
     /// over `exit_status`.
@@ -786,7 +875,7 @@ impl BrokerProcess {
             let mut state = self.state.lock();
             match state.status {
                 ProcessStatus::Running => {}
-                ProcessStatus::Exiting | ProcessStatus::Zombie(_) => return Ok(()),
+                ProcessStatus::Exiting | ProcessStatus::Exited(_) => return Ok(()),
                 ProcessStatus::Starting => return Err(BrokerError::WouldBlock),
                 ProcessStatus::Failed(error) => return Err(error),
             }
@@ -804,28 +893,159 @@ impl BrokerProcess {
     }
 
     /// Releases the resources of a process whose exit this caller claimed,
-    /// then makes it a zombie retaining `exit_status`.
+    /// then marks it exited, retaining `exit_status`.
+    ///
+    /// The exit is reported to the parent, which retains it until collected
+    /// unless it discards its children's exits. This process's children move
+    /// to the nearest of its running ancestors that adopts orphans, if any.
     fn finish_exit(&self, exit_status: ProcessExitStatus, release_thread_ids: bool) -> Result<()> {
         // Like Linux, release resources before the exit becomes observable, so
-        // a parent that reaps the child sees its pipes and sockets closed.
+        // a parent that collects the child's exit sees its pipes and sockets
+        // closed.
         if self.release_references() {
             self.state.lock().retirement.mark_abnormal();
         } else if release_thread_ids {
             self.release_threads(true);
         }
-        let parent = self.live_parent();
-        let exit_readiness = {
-            let mut state = self.state.lock();
-            state
+        // An exited process has no threads, even if teardown has not yet
+        // decided whether their IDs can be reused.
+        self.unregister_threads(&self.threads.lock());
+        // Children that cannot start without this process fail, as when its
+        // owner dies.
+        self.handle_owner_death();
+        {
+            let _tree = self.core.process_tree_lock.lock();
+            self.state
+                .lock()
                 .status
-                .transition(ProcessStatus::Zombie(exit_status))?;
-            Self::record_reaping(&mut state, parent.as_deref());
-            state.exit_readiness.take()
-        };
-        drop(parent);
+                .transition(ProcessStatus::Exited(exit_status))?;
+            let (parent, children) = {
+                let mut node = self.tree_node.lock();
+                node.exit_status = Some(exit_status);
+                (
+                    node.parent.as_ref().and_then(Weak::upgrade),
+                    core::mem::take(&mut node.children),
+                )
+            };
+            let adopter = Self::nearest_adopter(parent.clone()).filter(|adopter| {
+                // Without room for the orphans, they are left without a
+                // parent.
+                adopter
+                    .tree_node
+                    .lock()
+                    .children
+                    .try_reserve(children.len())
+                    .is_ok()
+            });
+            for child in children {
+                Self::adopt(adopter.as_ref(), child);
+            }
+            self.report_exit(parent.as_deref(), exit_status);
+        }
         self.core.process_lifecycle_sink.changed();
-        publish_exit_readiness(exit_readiness);
         Ok(())
+    }
+
+    /// Returns the nearest of `ancestor` and its ancestors that is running and
+    /// adopts orphans.
+    ///
+    /// Like Linux, this skips exiting ancestors, which could otherwise discard
+    /// an exited orphan's exit before passing their children on.
+    /// Callers hold the core's process tree lock.
+    fn nearest_adopter(mut ancestor: Option<Arc<Self>>) -> Option<Arc<Self>> {
+        while let Some(process) = ancestor {
+            let running = process.accepts_operations(&process.state.lock());
+            let node = process.tree_node.lock();
+            if running && node.adopts_orphans {
+                drop(node);
+                return Some(process);
+            }
+            let parent = node.parent.as_ref().and_then(Weak::upgrade);
+            drop(node);
+            ancestor = parent;
+        }
+        None
+    }
+
+    /// Makes `parent`, which has room for it, the parent of the orphan
+    /// `child`, or leaves `child` without one.
+    ///
+    /// An exited child reports its exit to its new parent as if it just
+    /// exited.
+    /// Callers hold the core's process tree lock.
+    fn adopt(parent: Option<&Arc<Self>>, child: Arc<Self>) {
+        let exit_status = {
+            let mut node = child.tree_node.lock();
+            node.parent = parent.map(Arc::downgrade);
+            node.exit_status
+        };
+        if let Some(parent) = parent {
+            parent.tree_node.lock().children.push(Arc::clone(&child));
+        }
+        if let Some(exit_status) = exit_status {
+            child.report_exit(parent.map(|parent| &**parent), exit_status);
+        }
+    }
+
+    /// Reports this exited process's exit to `parent`, which keeps this
+    /// process until it collects the exit, unless it discards its children's
+    /// exits. Without a parent, the exit is discarded at once.
+    ///
+    /// Callers hold the core's process tree lock.
+    fn report_exit(&self, parent: Option<&Self>, exit_status: ProcessExitStatus) {
+        let mut discarded = parent.is_none();
+        // The last reference may run this process's teardown, so it drops
+        // only after the parent's node lock is released.
+        let mut removed = None;
+        if let Some(parent) = parent {
+            {
+                let mut node = parent.tree_node.lock();
+                if !node.retain_child_exits {
+                    discarded = true;
+                    let index = node
+                        .children
+                        .iter()
+                        .position(|child| core::ptr::eq(Arc::as_ptr(child), self));
+                    removed = index.map(|index| node.children.remove(index));
+                }
+            }
+            parent.signals.post_child_exit(ChildExit {
+                process_id: self.id,
+                exit_status,
+            });
+        }
+        if discarded {
+            self.tree_node.lock().released = true;
+        }
+        drop(removed);
+    }
+
+    /// Removes this process, whose startup failed, from the process tree,
+    /// telling its parent, which may have found it live while collecting a
+    /// child's exit.
+    ///
+    /// Callers hold the core's process tree lock.
+    fn release_unstarted(&self) {
+        let parent = {
+            let mut node = self.tree_node.lock();
+            node.released = true;
+            node.parent.take().as_ref().and_then(Weak::upgrade)
+        };
+        let Some(parent) = parent else {
+            return;
+        };
+        let removed = {
+            let mut node = parent.tree_node.lock();
+            let index = node
+                .children
+                .iter()
+                .position(|child| core::ptr::eq(Arc::as_ptr(child), self));
+            index.map(|index| node.children.remove(index))
+        };
+        if removed.is_some() {
+            parent.signals.post_child_removed();
+        }
+        drop(removed);
     }
 
     /// Installs the host runner termination action.
@@ -841,44 +1061,47 @@ impl BrokerProcess {
     }
 
     /// Fails pending startup and returns the authoritative startup outcome.
+    ///
+    /// A process whose startup failed leaves the process tree, as if it had
+    /// never been created, except that its parent learns it was removed.
     pub fn fail_start(
         &self,
         error: BrokerError,
         abnormal: bool,
         expected_shutdown: bool,
     ) -> Result<()> {
-        let parent = self.live_parent();
-        let (shutdown, exit_readiness) = {
-            let mut state = self.state.lock();
-            match state.status {
-                ProcessStatus::Starting => {}
-                ProcessStatus::Running | ProcessStatus::Exiting | ProcessStatus::Zombie(_) => {
-                    return Ok(());
+        let shutdown = {
+            let _tree = self.core.process_tree_lock.lock();
+            let shutdown = {
+                let mut state = self.state.lock();
+                match state.status {
+                    ProcessStatus::Starting => {}
+                    ProcessStatus::Running | ProcessStatus::Exiting | ProcessStatus::Exited(_) => {
+                        return Ok(());
+                    }
+                    ProcessStatus::Failed(error) => return Err(error),
                 }
-                ProcessStatus::Failed(error) => return Err(error),
-            }
-            if abnormal {
-                state.retirement.mark_abnormal();
-            }
-            state.status.transition(ProcessStatus::Failed(error))?;
-            Self::record_reaping(&mut state, parent.as_deref());
-            state.continue_startup_on_parent_death = false;
-            if state.shutdown_request == ProcessShutdownRequest::None {
-                state.shutdown_request = if expected_shutdown {
-                    ProcessShutdownRequest::Expected
-                } else {
-                    ProcessShutdownRequest::Unexpected
-                };
-            }
-            (state.shutdown.clone(), state.exit_readiness.take())
+                if abnormal {
+                    state.retirement.mark_abnormal();
+                }
+                state.status.transition(ProcessStatus::Failed(error))?;
+                if state.shutdown_request == ProcessShutdownRequest::None {
+                    state.shutdown_request = if expected_shutdown {
+                        ProcessShutdownRequest::Expected
+                    } else {
+                        ProcessShutdownRequest::Unexpected
+                    };
+                }
+                state.shutdown.clone()
+            };
+            self.release_unstarted();
+            shutdown
         };
-        drop(parent);
         // Release the child's references before publishing the failure.
         if self.release_references() {
             self.state.lock().retirement.mark_abnormal();
         }
         self.core.process_lifecycle_sink.changed();
-        publish_exit_readiness(exit_readiness);
         if let Some(shutdown) = shutdown {
             shutdown();
         }
@@ -900,34 +1123,28 @@ impl BrokerProcess {
 
     /// Applies owner-death handling to every direct child process.
     ///
-    /// Ordinary startup fails and prepared duplication startup continues.
-    /// Children become orphans; their exit status remains only while this
-    /// process still holds their handles.
+    /// Children that are still starting fail.
+    /// Calling this method more than once is harmless.
     pub fn handle_owner_death(&self) {
         self.cancellation.cancel();
-        // Child creation checks cancellation under the state lock, so once this
-        // lock is taken every child created for a live owner is visible below.
         let pending_child_process = self.state.lock().pending_child_process.take();
-        // Drop non-children only after releasing the registry lock, because a
-        // final process drop removes itself from the registry.
-        let processes = {
-            let processes = self.core.processes.read();
-            processes
-                .values()
-                .filter_map(Weak::upgrade)
-                .collect::<Vec<_>>()
-        };
-
-        let mut changed = false;
         let mut shutdowns = Vec::new();
-        for child in processes.iter().filter(|process| process.is_child_of(self)) {
-            let (child_changed, shutdown) = child.handle_parent_death();
-            changed |= child_changed;
-            if let Some(shutdown) = shutdown {
-                shutdowns.push(shutdown);
-            }
-        }
-        drop(processes);
+        let changed = {
+            // Child creation checks cancellation under the tree lock, so once
+            // this lock is taken every child created for a live owner is
+            // listed.
+            let _tree = self.core.process_tree_lock.lock();
+            let mut children = core::mem::take(&mut self.tree_node.lock().children);
+            let count = children.len();
+            children.retain(|child| {
+                let (failed, shutdown) = child.handle_parent_death();
+                shutdowns.extend(shutdown);
+                !failed
+            });
+            let changed = children.len() != count;
+            self.tree_node.lock().children = children;
+            changed
+        };
         if changed {
             self.core.process_lifecycle_sink.changed();
         }
@@ -935,8 +1152,7 @@ impl BrokerProcess {
             shutdown();
         }
         if let Some(PendingChild { process: child, .. }) = pending_child_process {
-            let _ = child.fail_start(BrokerError::PeerClosed, false, true);
-            child.retire(true);
+            child.discard();
         }
     }
 
@@ -969,18 +1185,24 @@ impl BrokerProcess {
         self.is_active(state) && matches!(state.status, ProcessStatus::Starting)
     }
 
-    fn is_child_of(&self, parent: &BrokerProcess) -> bool {
+    pub(crate) fn is_child_of(&self, parent: &BrokerProcess) -> bool {
         // The weak reference keeps the parent's allocation, so its address
         // cannot be reused by another process.
-        self.parent
+        self.tree_node
+            .lock()
+            .parent
             .as_ref()
             .is_some_and(|own_parent| core::ptr::eq(own_parent.as_ptr(), parent))
     }
 
-    /// Fails ordinary startup after the parent's owner dies.
+    /// Fails this child if it is still starting after its parent's owner
+    /// dies, returning whether it failed and the runner shutdown to run.
+    ///
+    /// A child whose startup failed leaves the process tree. Callers hold the
+    /// core's process tree lock and remove the child from its parent.
     fn handle_parent_death(&self) -> (bool, Option<ProcessShutdown>) {
         let mut state = self.state.lock();
-        if state.status != ProcessStatus::Starting || state.continue_startup_on_parent_death {
+        if state.status != ProcessStatus::Starting {
             return (false, None);
         }
         state
@@ -990,6 +1212,9 @@ impl BrokerProcess {
         if state.shutdown_request == ProcessShutdownRequest::None {
             state.shutdown_request = ProcessShutdownRequest::Expected;
         }
+        let mut node = self.tree_node.lock();
+        node.released = true;
+        node.parent = None;
         (true, state.shutdown.clone())
     }
 
@@ -1034,11 +1259,19 @@ impl BrokerProcess {
     /// Panics if the shared ID allocator violates its range or uniqueness
     /// invariants.
     pub fn create_thread(&self) -> Result<ThreadId> {
+        self.add_thread(false)
+    }
+
+    fn add_thread(&self, initial: bool) -> Result<ThreadId> {
         let mut threads = self.threads.lock();
         if threads.len() >= self.core.limits.max_threads_per_process {
             return Err(BrokerError::ResourceExhausted);
         }
         threads
+            .try_reserve(1)
+            .map_err(|_| BrokerError::OutOfMemory)?;
+        let mut registry = self.core.threads.write();
+        registry
             .try_reserve(1)
             .map_err(|_| BrokerError::OutOfMemory)?;
         self.core
@@ -1057,9 +1290,17 @@ impl BrokerProcess {
             }
         };
         let thread_id = ThreadId(raw_id);
+        let thread = BrokerThread {
+            process_id: self.id,
+            initial,
+        };
         assert!(
             threads.insert(thread_id),
             "the ID allocator returned an occupied thread ID"
+        );
+        assert!(
+            registry.insert(thread_id, thread).is_none(),
+            "the ID allocator returned a registered thread ID"
         );
         Ok(thread_id)
     }
@@ -1070,6 +1311,7 @@ impl BrokerProcess {
         if !threads.remove(&thread_id) {
             return Err(BrokerError::UnknownObject);
         }
+        self.core.threads.write().remove(&thread_id);
         drop(threads);
         self.core
             .active_thread_count
@@ -1448,16 +1690,6 @@ impl BrokerProcess {
         object::set_status_flags(self, &object, request.mask, request.flags)
     }
 
-    /// Returns a process's termination status through a process handle.
-    ///
-    /// Returns `WouldBlock` while the process is live. A process whose startup
-    /// failed reports [`ProcessExitStatus::Unknown`].
-    pub fn process_exit_status(&self, handle: ObjectHandle) -> Result<ProcessTermination> {
-        let object = self.authorized_object(handle, ObjectRights::WAIT)?;
-        let object = object.read();
-        object.as_process()?.termination()
-    }
-
     /// Closes one object reference owned by this process.
     ///
     /// The underlying object is released when this was the last live reference.
@@ -1525,7 +1757,9 @@ impl BrokerProcess {
     ///
     /// Set `release_ids` only after fully accounted teardown. Final process
     /// drop otherwise retains IDs after an unwind or uncertain retirement.
-    /// Calling this method more than once is harmless.
+    /// Calling this method more than once is harmless. It never takes the
+    /// core's process tree lock, so a process may drop while that lock is
+    /// held.
     pub fn cleanup(&self, release_ids: bool) {
         let release_ids = {
             let mut state = self.state.lock();
@@ -1547,7 +1781,10 @@ impl BrokerProcess {
         let release_ids = release_ids && !invariant_fault;
         self.release_threads(release_ids);
         if release_ids {
-            self.core.ids.lock().release(self.id.0);
+            let membership = self.membership();
+            let mut ids = self.core.ids.lock();
+            ids.release(self.id.0);
+            Self::release_membership_ids(&mut ids, membership);
         }
         self.core.process_lifecycle_sink.changed();
     }
@@ -1612,10 +1849,23 @@ impl BrokerProcess {
         invariant_fault
     }
 
+    /// Removes `threads` from the core thread registry, so they no longer
+    /// resolve. Their IDs stay allocated.
+    fn unregister_threads(&self, threads: &HashSet<ThreadId>) {
+        let mut registry = self.core.threads.write();
+        for thread_id in threads {
+            registry.remove(thread_id);
+        }
+    }
+
     /// Removes every thread owned by this process, optionally releasing their
     /// IDs and global thread accounting.
     fn release_threads(&self, release_ids: bool) {
-        let threads = core::mem::take(&mut *self.threads.lock());
+        let threads = {
+            let mut threads = self.threads.lock();
+            self.unregister_threads(&threads);
+            core::mem::take(&mut *threads)
+        };
         if release_ids {
             self.core
                 .active_thread_count
@@ -1747,9 +1997,12 @@ mod tests {
     use litebox_broker_protocol::fs::{
         FileAccessMode, FileError, FileMode, FileOpenFlags, FileSeekWhence, FileType, FileUser,
     };
-    use litebox_broker_protocol::process::{CreatedProcess, ProcessExitStatus, ProcessTermination};
+    use litebox_broker_protocol::process::{
+        ChildExit, ChildSelector, ProcessExitStatus, ThreadInfo,
+    };
     use litebox_broker_protocol::readiness::ReadinessFlags;
-    use litebox_broker_protocol::{ObjectHandle, ProcessId};
+    use litebox_broker_protocol::signal::SignalEvent;
+    use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
     use std::{boxed::Box, sync::Arc, vec, vec::Vec};
 
     const TEST_MAX_REFERENCES: usize = 4;
@@ -1760,11 +2013,44 @@ mod tests {
     const EXITED: ProcessExitStatus = ProcessExitStatus::Exited { code: 23 };
     const SIGNALED: ProcessExitStatus = ProcessExitStatus::Signaled { signal: 11 };
 
-    fn termination(exit_status: ProcessExitStatus, reaped: bool) -> ProcessTermination {
-        ProcessTermination {
+    fn child_exit(child: &BrokerProcess, exit_status: ProcessExitStatus) -> ChildExit {
+        ChildExit {
+            process_id: child.id(),
             exit_status,
-            reaped,
         }
+    }
+
+    fn child_exited(child: &BrokerProcess, exit_status: ProcessExitStatus) -> SignalEvent {
+        SignalEvent::ChildExited(child_exit(child, exit_status))
+    }
+
+    /// Creates a starting child of `parent`.
+    fn child_of(parent: &BrokerProcess) -> Arc<BrokerProcess> {
+        parent
+            .core
+            .create_process(parent.caller_credential(), Some(parent.id()))
+            .unwrap()
+    }
+
+    /// Starts `process` if it is starting, then has it exit with
+    /// `exit_status`.
+    fn run_to_exit(process: &BrokerProcess, exit_status: ProcessExitStatus) {
+        if process.startup_result().is_none() {
+            process.complete_start().unwrap();
+        }
+        process.retire(true);
+        process.complete_exit(exit_status).unwrap();
+    }
+
+    /// Opens `process`'s signals, through which it learns of child exits.
+    fn open_signals(
+        process: &BrokerProcess,
+    ) -> (
+        ObjectHandle,
+        Arc<crate::readiness::tests::TestReadinessSink>,
+    ) {
+        let sink = readiness_sink();
+        (crate::signal::open(process, sink.clone()).unwrap(), sink)
     }
 
     #[derive(Default)]
@@ -1780,19 +2066,12 @@ mod tests {
 
     fn parent_id(process: &BrokerProcess) -> Option<ProcessId> {
         process
+            .tree_node
+            .lock()
             .parent
             .as_ref()
             .and_then(alloc::sync::Weak::upgrade)
             .map(|parent| parent.id())
-    }
-
-    fn prepared_duplication(parent: &Arc<BrokerProcess>) -> Arc<BrokerProcess> {
-        let child = parent
-            .core
-            .create_process(parent.caller_credential(), Some(parent.id()))
-            .unwrap();
-        parent.prepare_duplication_child(&child).unwrap();
-        child
     }
 
     fn process_statuses() -> [ProcessStatus; 5] {
@@ -1803,7 +2082,7 @@ mod tests {
             State::Running,
             State::Exiting,
             State::Failed(BrokerError::PeerClosed),
-            State::Zombie(EXITED),
+            State::Exited(EXITED),
         ]
     }
 
@@ -1818,7 +2097,7 @@ mod tests {
             (State::Starting, State::Exiting),
             (State::Starting, failed),
             (State::Running, State::Exiting),
-            (State::Exiting, State::Zombie(EXITED)),
+            (State::Exiting, State::Exited(EXITED)),
         ];
 
         for initial in states {
@@ -1862,8 +2141,7 @@ mod tests {
         let parent_sink = readiness_sink();
         let child_sink = readiness_sink();
         let (reader, writer) = crate::pipe::create(&parent, 4, 2, FileOpenFlags::NONE).unwrap();
-        let CreatedProcess { identity, .. } =
-            parent.allocate_child_process(parent_sink.clone()).unwrap();
+        let identity = parent.allocate_child_process().unwrap();
         // Sharing only the write end still lets the child wake the parent's reader.
         let child_writer = parent
             .duplicate_object_references_to_child(
@@ -1924,7 +2202,7 @@ mod tests {
     }
 
     #[test]
-    fn child_handle_retains_zombie_until_closed() {
+    fn exited_child_remains_until_its_exit_is_collected() {
         let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
@@ -1935,23 +2213,19 @@ mod tests {
             .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         root.complete_start().unwrap();
-        let sink = readiness_sink();
-        let (child, handle) = root.create_child_process(sink.clone()).unwrap();
+        let (signals, sink) = open_signals(&root);
+        let child = child_of(&root);
         let child_id = child.id();
         assert_eq!(
-            root.process_exit_status(handle),
+            root.collect_child_exit(ChildSelector::Any),
             Err(BrokerError::WouldBlock)
         );
-        assert_eq!(root.check_readiness(handle), Ok(ReadinessFlags::default()));
+        assert_eq!(root.check_readiness(signals), Ok(ReadinessFlags::default()));
         child.complete_start().unwrap();
         let (read, write) = crate::pipe::create(&root, 1, 1, FileOpenFlags::NONE).unwrap();
         root.duplicate_object_reference_to(write, &child, ObjectRights::WRITE)
             .unwrap();
         root.close_object_reference(write).unwrap();
-        assert_eq!(
-            root.duplicate_object_reference_to(handle, &child, ObjectRights::WAIT),
-            Err(BrokerError::UnsupportedOperation)
-        );
 
         child.retire(true);
         child.complete_exit(EXITED).unwrap();
@@ -1959,13 +2233,15 @@ mod tests {
         drop(child);
 
         assert_eq!(
-            *sink.published.lock().unwrap(),
-            [(handle, ReadinessFlags::READ)]
+            *sink.republished.lock().unwrap(),
+            [(signals, ReadinessFlags::READ)]
         );
-        assert_eq!(root.check_readiness(handle), Ok(ReadinessFlags::READ));
         assert_eq!(
-            root.process_exit_status(handle),
-            Ok(termination(EXITED, false))
+            crate::signal::take(&root, signals),
+            Ok(SignalEvent::ChildExited(ChildExit {
+                process_id: child_id,
+                exit_status: EXITED,
+            }))
         );
         assert!(
             root.check_readiness(read)
@@ -1978,16 +2254,249 @@ mod tests {
             broker.allocate_process(CallerCredential::Unauthenticated, None),
             Err(BrokerError::ResourceExhausted)
         ));
+        assert_eq!(
+            root.process_info(child_id).map(|info| info.parent),
+            Ok(Some(root.id()))
+        );
 
-        root.close_object_reference(handle).unwrap();
+        assert_eq!(
+            root.collect_child_exit(ChildSelector::Process(child_id)),
+            Ok(ChildExit {
+                process_id: child_id,
+                exit_status: EXITED,
+            })
+        );
 
-        assert_eq!(*sink.retired.lock().unwrap(), [handle]);
         assert!(!broker.processes.read().contains_key(&child_id));
+        assert_eq!(root.process_info(child_id), Err(BrokerError::UnknownObject));
+        assert_eq!(
+            root.collect_child_exit(ChildSelector::Any),
+            Err(BrokerError::UnknownObject)
+        );
         assert!(
             broker
                 .allocate_process(CallerCredential::Unauthenticated, None)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn collection_selects_the_oldest_exited_matching_child() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        let root = broker
+            .allocate_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        root.complete_start().unwrap();
+        let first = child_of(&root);
+        let second = child_of(&root);
+        let third = child_of(&root);
+        let pending = child_of(&root);
+        crate::process_group::set(&root, third.id(), third.id().into()).unwrap();
+        let other = broker
+            .allocate_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        let collect = |selector| root.collect_child_exit(selector);
+
+        // A child that has not started counts as live.
+        assert_eq!(collect(ChildSelector::Any), Err(BrokerError::WouldBlock));
+        run_to_exit(&third, SIGNALED);
+        run_to_exit(&second, EXITED);
+        run_to_exit(&first, EXITED);
+        assert_eq!(
+            collect(ChildSelector::Process(other.id())),
+            Err(BrokerError::UnknownObject)
+        );
+        assert_eq!(
+            collect(ChildSelector::ProcessGroup(other.id().into())),
+            Err(BrokerError::UnknownObject)
+        );
+        assert_eq!(
+            collect(ChildSelector::ProcessGroup(third.id().into())),
+            Ok(child_exit(&third, SIGNALED))
+        );
+        assert_eq!(
+            collect(ChildSelector::ProcessGroup(third.id().into())),
+            Err(BrokerError::UnknownObject)
+        );
+        assert_eq!(
+            collect(ChildSelector::Process(second.id())),
+            Ok(child_exit(&second, EXITED))
+        );
+        assert_eq!(
+            collect(ChildSelector::ProcessGroup(root.id().into())),
+            Ok(child_exit(&first, EXITED))
+        );
+        assert_eq!(
+            collect(ChildSelector::Process(pending.id())),
+            Err(BrokerError::WouldBlock)
+        );
+        assert_eq!(collect(ChildSelector::Any), Err(BrokerError::WouldBlock));
+
+        // Only a running process collects exits.
+        assert_eq!(
+            pending.collect_child_exit(ChildSelector::Any),
+            Err(BrokerError::PeerClosed)
+        );
+        run_to_exit(&pending, EXITED);
+        assert_eq!(
+            collect(ChildSelector::Any),
+            Ok(child_exit(&pending, EXITED))
+        );
+        assert_eq!(collect(ChildSelector::Any), Err(BrokerError::UnknownObject));
+    }
+
+    #[test]
+    fn orphans_move_to_the_nearest_adopting_ancestor() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        let root = broker
+            .allocate_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        root.complete_start().unwrap();
+        let adopter = child_of(&root);
+        adopter.complete_start().unwrap();
+        let middle = child_of(&adopter);
+        middle.complete_start().unwrap();
+        let exiting = child_of(&middle);
+        exiting.complete_start().unwrap();
+        let running = child_of(&exiting);
+        running.complete_start().unwrap();
+        let exited_child = child_of(&exiting);
+        run_to_exit(&exited_child, SIGNALED);
+        root.set_orphan_adoption(true).unwrap();
+        adopter.set_orphan_adoption(true).unwrap();
+        let (signals, _) = open_signals(&adopter);
+
+        run_to_exit(&exiting, EXITED);
+
+        // The adopter learns of the adopted child's exit, and collects it
+        // after its own children's.
+        assert_eq!(parent_id(&running), Some(adopter.id()));
+        assert_eq!(parent_id(&exited_child), Some(adopter.id()));
+        assert_eq!(
+            crate::signal::take(&adopter, signals),
+            Ok(child_exited(&exited_child, SIGNALED))
+        );
+        assert_eq!(
+            middle.collect_child_exit(ChildSelector::Any),
+            Ok(child_exit(&exiting, EXITED))
+        );
+        assert_eq!(
+            adopter.collect_child_exit(ChildSelector::Any),
+            Ok(child_exit(&exited_child, SIGNALED))
+        );
+        assert_eq!(
+            adopter.collect_child_exit(ChildSelector::Any),
+            Err(BrokerError::WouldBlock)
+        );
+        let info = root.process_info(running.id()).unwrap();
+        assert_eq!(info.creator, Some(exiting.id()));
+        assert_eq!(info.parent, Some(adopter.id()));
+
+        // Once the adopter exits, the next adopting ancestor adopts.
+        run_to_exit(&adopter, EXITED);
+        assert_eq!(parent_id(&running), Some(root.id()));
+        assert_eq!(parent_id(&middle), Some(root.id()));
+        run_to_exit(&running, EXITED);
+        assert_eq!(
+            root.collect_child_exit(ChildSelector::Any),
+            Ok(child_exit(&adopter, EXITED))
+        );
+        assert_eq!(
+            root.collect_child_exit(ChildSelector::Any),
+            Ok(child_exit(&running, EXITED))
+        );
+        assert_eq!(
+            root.collect_child_exit(ChildSelector::Any),
+            Err(BrokerError::WouldBlock)
+        );
+    }
+
+    #[test]
+    fn orphans_skip_exiting_adopters() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        let root = broker
+            .allocate_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        root.complete_start().unwrap();
+        let adopter = child_of(&root);
+        adopter.complete_start().unwrap();
+        let middle = child_of(&adopter);
+        middle.complete_start().unwrap();
+        let exiting = child_of(&middle);
+        exiting.complete_start().unwrap();
+        let running = child_of(&exiting);
+        running.complete_start().unwrap();
+        let exited_child = child_of(&exiting);
+        run_to_exit(&exited_child, SIGNALED);
+        adopter.set_orphan_adoption(true).unwrap();
+        middle.set_orphan_adoption(true).unwrap();
+        middle.set_child_exit_retention(false).unwrap();
+        let (signals, _) = open_signals(&adopter);
+        // Another caller has claimed the middle process's exit.
+        middle.state.lock().status = ProcessStatus::Exiting;
+
+        run_to_exit(&exiting, EXITED);
+
+        // The exiting middle process would have discarded the exit at once.
+        assert_eq!(parent_id(&running), Some(adopter.id()));
+        assert_eq!(parent_id(&exited_child), Some(adopter.id()));
+        assert_eq!(
+            crate::signal::take(&adopter, signals),
+            Ok(child_exited(&exited_child, SIGNALED))
+        );
+        assert_eq!(
+            adopter.collect_child_exit(ChildSelector::Any),
+            Ok(child_exit(&exited_child, SIGNALED))
+        );
+    }
+
+    #[test]
+    fn orphans_without_an_adopter_are_discarded_when_they_exit() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        let root = broker
+            .allocate_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        root.complete_start().unwrap();
+        let exited_child = child_of(&root);
+        let exited_child_id = exited_child.id();
+        run_to_exit(&exited_child, EXITED);
+        drop(exited_child);
+        let running = child_of(&root);
+        let running_id = running.id();
+        running.complete_start().unwrap();
+
+        root.handle_owner_death();
+        root.complete_exit(EXITED).unwrap();
+
+        // The exited root and its exited child no longer exist.
+        assert!(!broker.processes.read().contains_key(&exited_child_id));
+        assert_eq!(
+            running.process_info(root.id()),
+            Err(BrokerError::UnknownObject)
+        );
+        let info = running.process_info(running_id).unwrap();
+        assert_eq!(info.creator, Some(root.id()));
+        assert_eq!(info.parent, None);
+        running.retire(true);
+        running.complete_exit(EXITED).unwrap();
+        drop(running);
+        assert!(!broker.processes.read().contains_key(&running_id));
     }
 
     #[test]
@@ -2001,8 +2510,8 @@ mod tests {
             .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         root.complete_start().unwrap();
-        let sink = readiness_sink();
-        let (child, handle) = root.create_child_process(sink.clone()).unwrap();
+        let (signals, sink) = open_signals(&root);
+        let child = child_of(&root);
         child.complete_start().unwrap();
         let (read, write) = crate::pipe::create(&root, 1, 1, FileOpenFlags::NONE).unwrap();
         root.duplicate_object_reference_to(write, &child, ObjectRights::WRITE)
@@ -2021,11 +2530,11 @@ mod tests {
                 .contains(ReadinessFlags::HANGUP)
         );
         assert_eq!(
-            root.process_exit_status(handle),
+            root.collect_child_exit(ChildSelector::Any),
             Err(BrokerError::WouldBlock)
         );
-        assert_eq!(root.check_readiness(handle), Ok(ReadinessFlags::default()));
-        assert!(sink.published.lock().unwrap().is_empty());
+        assert_eq!(root.check_readiness(signals), Ok(ReadinessFlags::default()));
+        assert!(sink.republished.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -2039,7 +2548,7 @@ mod tests {
             .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         root.complete_start().unwrap();
-        let (child, handle) = root.create_child_process(readiness_sink()).unwrap();
+        let child = child_of(&root);
         assert_eq!(
             child.report_exit_status(SIGNALED),
             Err(BrokerError::PeerClosed)
@@ -2051,13 +2560,13 @@ mod tests {
         child.complete_exit(EXITED).unwrap();
 
         assert_eq!(
-            root.process_exit_status(handle),
-            Ok(termination(SIGNALED, false))
+            root.collect_child_exit(ChildSelector::Any),
+            Ok(child_exit(&child, SIGNALED))
         );
     }
 
     #[test]
-    fn children_apply_reaping_setting_when_they_terminate() {
+    fn children_apply_exit_retention_setting_when_they_terminate() {
         let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
@@ -2067,81 +2576,59 @@ mod tests {
             .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         root.complete_start().unwrap();
-        let sink = readiness_sink();
-        let (zombie, zombie_handle) = root.create_child_process(sink.clone()).unwrap();
-        let (reaped, reaped_handle) = root.create_child_process(sink.clone()).unwrap();
-        let (failed, failed_handle) = root.create_child_process(sink.clone()).unwrap();
-        assert_eq!(zombie.set_child_reaping(true), Err(BrokerError::PeerClosed));
-        let exit = |child: &BrokerProcess| {
-            child.complete_start().unwrap();
-            child.retire(true);
-            child.complete_exit(EXITED).unwrap();
-        };
+        let (signals, sink) = open_signals(&root);
+        let retained = child_of(&root);
+        let discarded = child_of(&root);
+        let failed = child_of(&root);
+        assert_eq!(
+            retained.set_child_exit_retention(false),
+            Err(BrokerError::PeerClosed)
+        );
 
-        exit(&zombie);
-        root.set_child_reaping(true).unwrap();
-        exit(&reaped);
+        run_to_exit(&retained, EXITED);
+        root.set_child_exit_retention(false).unwrap();
+        run_to_exit(&discarded, SIGNALED);
         assert_eq!(
             failed.fail_start(BrokerError::PeerClosed, false, true),
             Err(BrokerError::PeerClosed)
         );
 
+        // Both exits are notified, coalescing into the first, but only the
+        // one before retention was disabled is kept. A failed child is
+        // removed.
         assert_eq!(
-            root.process_exit_status(zombie_handle),
-            Ok(termination(EXITED, false))
-        );
-        assert_eq!(
-            root.process_exit_status(reaped_handle),
-            Ok(termination(EXITED, true))
-        );
-        assert_eq!(
-            root.process_exit_status(failed_handle),
-            Ok(termination(ProcessExitStatus::Unknown, true))
-        );
-        assert_eq!(
-            *sink.published.lock().unwrap(),
+            *sink.republished.lock().unwrap(),
             [
-                (zombie_handle, ReadinessFlags::READ),
-                (reaped_handle, ReadinessFlags::READ),
-                (failed_handle, ReadinessFlags::READ),
+                (signals, ReadinessFlags::READ),
+                (signals, ReadinessFlags::READ)
             ]
         );
-    }
-
-    #[test]
-    fn parent_exit_releases_child_handles() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
-            ObjectRights::all(),
-        ))
-        .build()
-        .unwrap();
-        let root = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
-            .unwrap();
-        root.complete_start().unwrap();
-        let sink = readiness_sink();
-        let (zombie, zombie_handle) = root.create_child_process(sink.clone()).unwrap();
-        let zombie_id = zombie.id();
-        zombie.complete_start().unwrap();
-        zombie.retire(true);
-        zombie.complete_exit(EXITED).unwrap();
-        drop(zombie);
-        let (running, running_handle) = root.create_child_process(sink.clone()).unwrap();
-        let running_id = running.id();
-        running.complete_start().unwrap();
-
-        root.handle_owner_death();
-        root.complete_exit(EXITED).unwrap();
-
         assert_eq!(
-            *sink.retired.lock().unwrap(),
-            [running_handle, zombie_handle]
+            crate::signal::take(&root, signals),
+            Ok(child_exited(&retained, EXITED))
         );
-        assert!(!broker.processes.read().contains_key(&zombie_id));
-        running.retire(true);
-        running.complete_exit(EXITED).unwrap();
-        drop(running);
-        assert!(!broker.processes.read().contains_key(&running_id));
+        assert_eq!(
+            crate::signal::take(&root, signals),
+            Ok(SignalEvent::ChildRemoved)
+        );
+        assert_eq!(
+            crate::signal::take(&root, signals),
+            Err(BrokerError::WouldBlock)
+        );
+        for child in [&discarded, &failed] {
+            assert_eq!(
+                root.process_info(child.id()),
+                Err(BrokerError::UnknownObject)
+            );
+        }
+        assert_eq!(
+            root.collect_child_exit(ChildSelector::Any),
+            Ok(child_exit(&retained, EXITED))
+        );
+        assert_eq!(
+            root.collect_child_exit(ChildSelector::Any),
+            Err(BrokerError::UnknownObject)
+        );
     }
 
     #[test]
@@ -2155,8 +2642,8 @@ mod tests {
             .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         root.complete_start().unwrap();
-        let sink = readiness_sink();
-        let (child, handle) = root.create_child_process(sink.clone()).unwrap();
+        let (signals, sink) = open_signals(&root);
+        let child = child_of(&root);
         let child_id = child.id();
 
         assert_eq!(
@@ -2168,37 +2655,25 @@ mod tests {
             child.state.lock().status,
             ProcessStatus::Failed(BrokerError::PeerClosed)
         );
+        // The parent learns the child is gone, but not that it exited.
+        assert_eq!(sink.republished.lock().unwrap().len(), 1);
         assert_eq!(
-            *sink.published.lock().unwrap(),
-            [(handle, ReadinessFlags::READ)]
+            crate::signal::take(&root, signals),
+            Ok(SignalEvent::ChildRemoved)
         );
+        assert_eq!(
+            crate::signal::take(&root, signals),
+            Err(BrokerError::WouldBlock)
+        );
+        assert_eq!(
+            root.collect_child_exit(ChildSelector::Any),
+            Err(BrokerError::UnknownObject)
+        );
+        assert_eq!(root.process_info(child_id), Err(BrokerError::UnknownObject));
         child.retire(true);
         drop(child);
-        root.close_object_reference(handle).unwrap();
 
         assert!(!broker.processes.read().contains_key(&child_id));
-    }
-
-    #[test]
-    fn process_duplication_policy_is_enforced_at_admission() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
-            ObjectRights::all(),
-        ))
-        .build()
-        .unwrap();
-        let parent = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
-            .unwrap();
-        parent.complete_start().unwrap();
-        let child = broker
-            .allocate_process(parent.caller_credential(), Some(parent.id()))
-            .unwrap();
-
-        assert!(matches!(
-            parent.prepare_duplication_child(&child),
-            Err(BrokerError::PolicyDenied)
-        ));
-        child.complete_start().unwrap();
     }
 
     #[test]
@@ -2213,7 +2688,7 @@ mod tests {
             .unwrap();
         parent.complete_start().unwrap();
         assert_eq!(
-            parent.allocate_child_process(readiness_sink()),
+            parent.allocate_child_process(),
             Err(BrokerError::PolicyDenied)
         );
     }
@@ -2231,15 +2706,13 @@ mod tests {
             .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         parent.complete_start().unwrap();
-        let sink = readiness_sink();
-        let CreatedProcess { identity, handle } =
-            parent.allocate_child_process(sink.clone()).unwrap();
+        let identity = parent.allocate_child_process().unwrap();
         let process_id = identity.process_id;
         assert_eq!(
-            parent.allocate_child_process(sink.clone()),
+            parent.allocate_child_process(),
             Err(BrokerError::WouldBlock)
         );
-        assert_eq!(parent.references.lock().handles, [handle]);
+        assert_eq!(parent.references.lock().handles, []);
         assert!(matches!(
             parent.take_child_process(ProcessId(process_id.0 + 1)),
             Err(BrokerError::UnknownObject)
@@ -2255,6 +2728,57 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_child_process_vanishes() {
+        let broker = TestBrokerCoreBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true),
+        )
+        .build()
+        .unwrap();
+        let parent = broker
+            .allocate_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        parent.complete_start().unwrap();
+        let (signals, _) = open_signals(&parent);
+        let process_id = parent.allocate_child_process().unwrap().process_id;
+        let child = parent.with_pending_child(process_id, Arc::clone).unwrap();
+        assert_eq!(
+            parent.cancel_child_process(ProcessId(process_id.0 + 1)),
+            Err(BrokerError::UnknownObject)
+        );
+        assert_eq!(
+            parent.collect_child_exit(ChildSelector::Any),
+            Err(BrokerError::WouldBlock)
+        );
+
+        parent.cancel_child_process(process_id).unwrap();
+
+        // A parent that found the child live while collecting learns it is
+        // gone.
+        assert_eq!(
+            crate::signal::take(&parent, signals),
+            Ok(SignalEvent::ChildRemoved)
+        );
+        assert_eq!(child.startup_result(), Some(Err(BrokerError::PeerClosed)));
+        assert_eq!(
+            parent.process_info(process_id),
+            Err(BrokerError::UnknownObject)
+        );
+        assert_eq!(
+            parent.collect_child_exit(ChildSelector::Any),
+            Err(BrokerError::UnknownObject)
+        );
+        assert_eq!(
+            parent.cancel_child_process(process_id),
+            Err(BrokerError::UnknownObject)
+        );
+        drop(child);
+        assert!(!broker.processes.read().contains_key(&process_id));
+        // The pending slot is free again.
+        parent.allocate_child_process().unwrap();
+    }
+
+    #[test]
     fn owner_death_fails_and_retires_pending_child_process() {
         let broker = TestBrokerCoreBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
@@ -2266,9 +2790,7 @@ mod tests {
             .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         parent.complete_start().unwrap();
-        let CreatedProcess { identity, handle } =
-            parent.allocate_child_process(readiness_sink()).unwrap();
-        let process_id = identity.process_id;
+        let process_id = parent.allocate_child_process().unwrap().process_id;
         let child = broker
             .processes
             .read()
@@ -2279,10 +2801,8 @@ mod tests {
         parent.handle_owner_death();
 
         assert_eq!(child.startup_result(), Some(Err(BrokerError::PeerClosed)));
-        assert_eq!(
-            parent.process_exit_status(handle),
-            Ok(termination(ProcessExitStatus::Unknown, false))
-        );
+        assert!(child.is_released());
+        assert!(parent.tree_node.lock().children.is_empty());
         assert!(matches!(
             parent.take_child_process(process_id),
             Err(BrokerError::PeerClosed)
@@ -2290,7 +2810,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_child_exit_leaves_waitable_zombie_without_starting() {
+    fn pending_child_exit_leaves_collectable_exit_without_starting() {
         let lifecycle = Arc::new(TestProcessLifecycleSink::default());
         let broker = TestBrokerCoreBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
@@ -2303,23 +2823,25 @@ mod tests {
             .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         parent.complete_start().unwrap();
-        let sink = readiness_sink();
-        let CreatedProcess { identity, handle } =
-            parent.allocate_child_process(sink.clone()).unwrap();
-        let process_id = identity.process_id;
+        let (signals, sink) = open_signals(&parent);
+        let process_id = parent.allocate_child_process().unwrap().process_id;
         let changes = lifecycle.changes.load(Ordering::Relaxed);
         let threads = broker.active_thread_count.load(Ordering::Relaxed);
 
         assert_eq!(parent.exit_child_process(process_id, EXITED), Ok(()));
 
+        let exit = ChildExit {
+            process_id,
+            exit_status: EXITED,
+        };
         assert_eq!(
-            parent.process_exit_status(handle),
-            Ok(termination(EXITED, false))
+            crate::signal::take(&parent, signals),
+            Ok(SignalEvent::ChildExited(exit))
         );
         assert_eq!(lifecycle.changes.load(Ordering::Relaxed), changes + 1);
         assert_eq!(
-            *sink.published.lock().unwrap(),
-            [(handle, ReadinessFlags::READ)]
+            *sink.republished.lock().unwrap(),
+            [(signals, ReadinessFlags::READ)]
         );
         assert_eq!(
             broker.active_thread_count.load(Ordering::Relaxed),
@@ -2330,9 +2852,9 @@ mod tests {
             Err(BrokerError::UnknownObject)
         );
 
-        // The zombie stays until its handle closes.
+        // The exited child stays until its exit is collected.
         assert!(broker.processes.read().contains_key(&process_id));
-        parent.close_object_reference(handle).unwrap();
+        assert_eq!(parent.collect_child_exit(ChildSelector::Any), Ok(exit));
         assert!(!broker.processes.read().contains_key(&process_id));
     }
 
@@ -2363,11 +2885,7 @@ mod tests {
             .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         parent.complete_start().unwrap();
-        let process_id = parent
-            .allocate_child_process(readiness_sink())
-            .unwrap()
-            .identity
-            .process_id;
+        let process_id = parent.allocate_child_process().unwrap().process_id;
         let writes = Arc::new(std::sync::Mutex::new(Vec::new()));
         let created = AtomicUsize::new(0);
         let create = |capacity| {
@@ -2437,11 +2955,7 @@ mod tests {
                 .allocate_process(CallerCredential::Unauthenticated, None)
                 .unwrap();
             parent.complete_start().unwrap();
-            let child = parent
-                .allocate_child_process(readiness_sink())
-                .unwrap()
-                .identity
-                .process_id;
+            let child = parent.allocate_child_process().unwrap().process_id;
             (parent, child)
         };
         let write = |parent: &BrokerProcess, child, offset, length| {
@@ -2495,8 +3009,7 @@ mod tests {
             .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         parent.complete_start().unwrap();
-        let CreatedProcess { identity, handle } =
-            parent.allocate_child_process(readiness_sink()).unwrap();
+        let identity = parent.allocate_child_process().unwrap();
 
         parent.handle_owner_death();
 
@@ -2504,10 +3017,7 @@ mod tests {
             parent.exit_child_process(identity.process_id, EXITED),
             Err(BrokerError::PeerClosed)
         );
-        assert_eq!(
-            parent.process_exit_status(handle),
-            Ok(termination(ProcessExitStatus::Unknown, false))
-        );
+        assert!(parent.tree_node.lock().children.is_empty());
     }
 
     #[test]
@@ -2522,9 +3032,7 @@ mod tests {
             .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         parent.complete_start().unwrap();
-        let CreatedProcess { identity, handle } =
-            parent.allocate_child_process(readiness_sink()).unwrap();
-        let child_id = identity.process_id;
+        let child_id = parent.allocate_child_process().unwrap().process_id;
         let child = broker
             .processes
             .read()
@@ -2539,9 +3047,10 @@ mod tests {
             parent.duplicate_object_references_to_child(ProcessId(child_id.0 + 1), &[first], &sink),
             Err(BrokerError::UnknownObject)
         );
-        // A process reference is not duplicable, so the child receives nothing.
+        // A signals reference is not duplicable, so the child receives nothing.
+        let signals = crate::signal::open(&parent, readiness_sink()).unwrap();
         assert_eq!(
-            parent.duplicate_object_references_to_child(child_id, &[first, handle], &sink),
+            parent.duplicate_object_references_to_child(child_id, &[first, signals], &sink),
             Err(BrokerError::UnsupportedOperation)
         );
         assert_eq!(child.references.lock().handles, []);
@@ -2567,8 +3076,7 @@ mod tests {
         );
 
         // A child that fails to start also releases them while its parent still holds it.
-        let CreatedProcess { identity, .. } =
-            parent.allocate_child_process(readiness_sink()).unwrap();
+        let identity = parent.allocate_child_process().unwrap();
         parent
             .duplicate_object_references_to_child(identity.process_id, &[first], &sink)
             .unwrap();
@@ -2582,123 +3090,6 @@ mod tests {
             parent.check_readiness(first),
             Ok(ReadinessFlags::READ | ReadinessFlags::WRITE)
         );
-    }
-
-    #[test]
-    fn duplication_preparation_validates_the_created_child() {
-        let broker = TestBrokerCoreBuilder::new(
-            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-                .with_process_duplication_enabled(true),
-        )
-        .build()
-        .unwrap();
-        let owner = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
-            .unwrap();
-        owner.complete_start().unwrap();
-        let other_owner = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
-            .unwrap();
-        other_owner.complete_start().unwrap();
-        let child = broker
-            .create_process(owner.caller_credential(), Some(owner.id()))
-            .unwrap();
-
-        assert_eq!(
-            other_owner.prepare_duplication_child(&child),
-            Err(BrokerError::Internal)
-        );
-        assert_eq!(child.startup_result(), None);
-        owner.prepare_duplication_child(&child).unwrap();
-        assert_eq!(
-            owner.prepare_duplication_child(&child),
-            Err(BrokerError::Internal)
-        );
-        child.complete_start().unwrap();
-        assert!(child.is_running());
-        assert_eq!(
-            owner.prepare_duplication_child(&owner),
-            Err(BrokerError::Internal)
-        );
-    }
-
-    #[test]
-    fn duplication_children_publish_independently() {
-        let broker = TestBrokerCoreBuilder::new(
-            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-                .with_process_duplication_enabled(true),
-        )
-        .build()
-        .unwrap();
-        let parent = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
-            .unwrap();
-        parent.complete_start().unwrap();
-        let first_child = prepared_duplication(&parent);
-        let second_child = prepared_duplication(&parent);
-
-        first_child.complete_start().unwrap();
-        second_child.complete_start().unwrap();
-
-        assert!(first_child.is_running());
-        assert!(second_child.is_running());
-    }
-
-    #[test]
-    fn duplication_publication_survives_parent_teardown_and_rejects_child_failure() {
-        let broker = TestBrokerCoreBuilder::new(
-            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-                .with_process_duplication_enabled(true),
-        )
-        .build()
-        .unwrap();
-
-        let cancelled_parent = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
-            .unwrap();
-        cancelled_parent.complete_start().unwrap();
-        let cancelled_child = prepared_duplication(&cancelled_parent);
-        let unprepared_child = broker
-            .allocate_process(
-                cancelled_parent.caller_credential(),
-                Some(cancelled_parent.id()),
-            )
-            .unwrap();
-        let shutdowns = Arc::new(AtomicUsize::new(0));
-        let shutdown_count = Arc::clone(&shutdowns);
-        cancelled_child.install_shutdown(Arc::new(move || {
-            shutdown_count.fetch_add(1, Ordering::Relaxed);
-        }));
-        cancelled_parent.request_cancellation();
-
-        cancelled_child.complete_start().unwrap();
-        assert_eq!(cancelled_child.state.lock().status, ProcessStatus::Running);
-        assert_eq!(shutdowns.load(Ordering::Relaxed), 0);
-        assert!(matches!(
-            cancelled_parent.prepare_duplication_child(&unprepared_child),
-            Err(BrokerError::PeerClosed)
-        ));
-
-        let dead_parent = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
-            .unwrap();
-        dead_parent.complete_start().unwrap();
-        let dead_child = prepared_duplication(&dead_parent);
-        dead_parent.handle_owner_death();
-
-        dead_child.complete_start().unwrap();
-        assert_eq!(dead_child.state.lock().status, ProcessStatus::Running);
-
-        let live_parent = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
-            .unwrap();
-        live_parent.complete_start().unwrap();
-        let failed_child = prepared_duplication(&live_parent);
-        assert_eq!(
-            failed_child.fail_start(BrokerError::PeerClosed, false, true),
-            Err(BrokerError::PeerClosed)
-        );
-        assert_eq!(failed_child.complete_start(), Err(BrokerError::PeerClosed));
     }
 
     #[test]
@@ -2913,6 +3304,57 @@ mod tests {
 
         assert_eq!(second.exit_thread(thread), Err(BrokerError::UnknownObject));
         assert_eq!(first.exit_thread(thread), Ok(()));
+    }
+
+    #[test]
+    fn thread_info_names_the_owning_process() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        let root = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        root.complete_start().unwrap();
+        let child = child_of(&root);
+        let thread = child.create_thread().unwrap();
+
+        assert_eq!(
+            root.thread_info(root.initial_thread_id()),
+            Ok(ThreadInfo {
+                process_id: root.id(),
+                initial: true,
+            })
+        );
+        assert_eq!(
+            root.thread_info(thread),
+            Ok(ThreadInfo {
+                process_id: child.id(),
+                initial: false,
+            })
+        );
+        // A process ID names no thread.
+        assert_eq!(
+            root.thread_info(ThreadId(root.id().0)),
+            Err(BrokerError::UnknownObject)
+        );
+        child.exit_thread(thread).unwrap();
+        assert_eq!(root.thread_info(thread), Err(BrokerError::UnknownObject));
+        run_to_exit(&child, EXITED);
+        assert_eq!(
+            root.thread_info(child.initial_thread_id()),
+            Err(BrokerError::UnknownObject)
+        );
+
+        // Threads of a process that exits without clean retirement end too,
+        // though their IDs stay allocated.
+        let child = child_of(&root);
+        let thread = child.create_thread().unwrap();
+        child.complete_start().unwrap();
+        child.retire(false);
+        child.complete_exit(EXITED).unwrap();
+        assert_eq!(root.thread_info(thread), Err(BrokerError::UnknownObject));
     }
 
     #[test]

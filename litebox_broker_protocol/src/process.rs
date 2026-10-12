@@ -3,10 +3,11 @@
 
 use alloc::vec::Vec;
 
+use crate::process_group::ProcessGroupMembership;
 use crate::shared_buffer::{
     MAX_SHARED_BUFFER_SEQUENCE_SLOTS, SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence,
 };
-use crate::{ObjectHandle, ProcessId, ThreadId};
+use crate::{ProcessGroupId, ProcessId, ThreadId};
 
 /// Maximum size of one process bootstrap carried through the broker.
 pub const MAX_PROCESS_BOOTSTRAP_SIZE: u32 = 64 * 1024;
@@ -34,7 +35,7 @@ pub struct ProcessIdentity {
     pub initial_thread_id: ThreadId,
 }
 
-/// Portable process termination status retained until the process is reaped.
+/// Portable process termination status retained until it is collected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ProcessExitStatus {
@@ -49,45 +50,50 @@ pub enum ProcessExitStatus {
     Unknown,
 }
 
-/// A terminated process's status as its handle observes it.
+/// A child process's exit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ProcessTermination {
-    /// Termination status.
+pub struct ChildExit {
+    /// Child that exited.
+    pub process_id: ProcessId,
+    /// Child's termination status.
     pub exit_status: ProcessExitStatus,
-    /// Whether the process was reaped when it terminated, so no wait reports
-    /// it.
-    pub reaped: bool,
 }
 
-/// One newly created process and the creator's handle to it.
-///
-/// The handle reports [`ReadinessFlags::READ`](crate::readiness::ReadinessFlags::READ)
-/// once the process terminates. Closing it releases the process's retained
-/// exit status.
+/// Selects which of the caller's children an exit collection considers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CreatedProcess {
-    /// Broker-assigned process identity.
-    pub identity: ProcessIdentity,
-    /// Handle used to observe process termination.
-    pub handle: ObjectHandle,
+pub enum ChildSelector {
+    /// Any child.
+    Any,
+    /// One child.
+    Process(ProcessId),
+    /// Any child in a process group.
+    ProcessGroup(ProcessGroupId),
 }
 
-/// Selects whether thread creation extends the current process or creates a child process.
+/// A process's place in the process tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CreateThreadRequest {
-    /// Creates another thread in the requesting process.
-    Thread,
-    /// Creates a pending child process and its initial thread.
-    Process,
+pub struct ProcessInfo {
+    /// Process that created this one, absent for a root process.
+    ///
+    /// The creator never changes, even after it exits.
+    pub creator: Option<ProcessId>,
+    /// Process that collects this one's exit.
+    ///
+    /// The parent starts as the creator. When it exits, the nearest running
+    /// ancestor that adopts orphans becomes the parent, or none does and the
+    /// process's exit is discarded.
+    pub parent: Option<ProcessId>,
+    /// Process group and session.
+    pub membership: ProcessGroupMembership,
 }
 
-/// Successful thread or process creation result.
+/// The process a thread belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CreateThreadResponse {
-    /// A thread was created in the requesting process.
-    Thread(ThreadId),
-    /// A pending child process was created.
-    Process(CreatedProcess),
+pub struct ThreadInfo {
+    /// Process the thread belongs to.
+    pub process_id: ProcessId,
+    /// Whether the thread is the process's initial thread.
+    pub initial: bool,
 }
 
 /// Starts a pending child created earlier.
@@ -154,6 +160,6 @@ pub struct WriteChildMemoryRequest {
 pub struct ExitChildProcessRequest {
     /// Pending child that exited.
     pub child_process_id: ProcessId,
-    /// Termination status retained until the child is reaped.
+    /// Termination status retained until it is collected.
     pub exit_status: ProcessExitStatus,
 }
