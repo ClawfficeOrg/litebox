@@ -6,6 +6,7 @@
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
+use core::ops::Range;
 use litebox::fs::errors::ReadError;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox_common_linux::{
@@ -62,6 +63,8 @@ pub(crate) struct ElfPatchState {
     trampoline_mapped: bool,
     /// Total number of trampoline bytes currently mapped.
     trampoline_mapped_len: usize,
+    /// Inaccessible range reserved by the initial file mapping for a runtime trampoline.
+    runtime_trampoline_reservation: Option<Range<usize>>,
     /// Whether any runtime-generated stubs were successfully linked from code
     /// in this fd to the trampoline.
     runtime_patches_committed: bool,
@@ -128,7 +131,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         len: usize,
         prot: ProtFlags,
         flags: MapFlags,
-        ensure_space_after: bool,
         op: impl FnOnce(UserPtrMut<u8>) -> Result<usize, MappingError>,
     ) -> Result<UserPtrMut<u8>, MappingError> {
         self.global.mm.do_mmap(
@@ -136,10 +138,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             len,
             prot,
             flags,
-            litebox_common_linux::mm::MmapPlacement {
-                direction: litebox::platform::page_mgmt::AllocationDirection::TopDown,
-                ensure_space_after,
-            },
+            litebox::platform::page_mgmt::AllocationDirection::TopDown,
             op,
         )
     }
@@ -153,7 +152,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         flags: MapFlags,
     ) -> Result<UserPtrMut<u8>, Errno> {
         let op = |_| Ok(0);
-        self.do_mmap(suggested_addr, len, prot, flags, false, op)
+        self.do_mmap(suggested_addr, len, prot, flags, op)
             .map_err(Errno::from)
     }
 
@@ -170,41 +169,131 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let AnyTypedFd::Fs(typed_fd) = self.typed_fd(fd)? else {
             return Err(Errno::ENODEV);
         };
+        let syscall_entry = self.global.platform.get_syscall_entry_point();
 
-        // Perform the normal mmap first (CoW or memcpy fallback).
-        let result = if let Some(cow_result) =
-            self.try_cow_mmap_file(suggested_addr, len, prot, flags, &typed_fd, offset)
-        {
-            cow_result?
+        let reserves_trampoline = offset == 0
+            && syscall_entry != 0
+            && !flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE);
+
+        // A CoW allocation cannot retain a separate trailing reservation, so use the memcpy path
+        // when runtime trampoline space is required.
+        let cow_result = if reserves_trampoline {
+            None
         } else {
-            self.do_mmap_file_memcpy(suggested_addr, len, prot, flags, &typed_fd, offset)?
+            self.try_cow_mmap_file(suggested_addr, len, prot, flags, &typed_fd, offset)
+                .transpose()?
+        };
+        let reservation = if reserves_trampoline {
+            let reserved_len = len
+                .checked_add(crate::RUNTIME_TRAMPOLINE_RESERVATION_SIZE)
+                .ok_or(MappingError::OutOfMemory)?;
+            let suggested_addr = match suggested_addr {
+                Some(address) => Some(
+                    litebox_common_linux::vmem::NonZeroAddress::new(address)
+                        .ok_or(MappingError::UnAligned)?,
+                ),
+                None => None,
+            };
+            // SAFETY: The inaccessible mapping is exclusively owned until its prefix is replaced.
+            let pointer = unsafe {
+                self.global.mm.create_inaccessible_pages(
+                    suggested_addr,
+                    litebox_common_linux::vmem::NonZeroPageSize::new(reserved_len)
+                        .ok_or(MappingError::UnAligned)?,
+                    CreatePagesFlags::TOP_DOWN,
+                    |_| Ok(0),
+                )
+            }?;
+            let start = UserPtrMut::from_platform_ptr::<Platform>(pointer).as_usize();
+            let end = start
+                .checked_add(reserved_len)
+                .expect("successful reservation must fit in the address space");
+            Some(start..end)
+        } else {
+            None
+        };
+        let mapping_addr = reservation
+            .as_ref()
+            .map_or(suggested_addr, |range| Some(range.start));
+        let mapping_flags = if reservation.is_some() {
+            flags | MapFlags::MAP_FIXED
+        } else {
+            flags
+        };
+        let result = if let Some(cow_result) = cow_result {
+            cow_result
+        } else {
+            match self.do_mmap_file_memcpy(
+                mapping_addr,
+                len,
+                prot,
+                mapping_flags,
+                &typed_fd,
+                offset,
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    if let Some(range) = reservation.as_ref() {
+                        let prefix_already_unmapped = matches!(
+                            error,
+                            MappingError::BadFD(_)
+                                | MappingError::NotAFile
+                                | MappingError::NotForReading
+                                | MappingError::ProtectError(_)
+                        );
+                        let cleanup_start = if prefix_already_unmapped {
+                            range.start + len
+                        } else {
+                            range.start
+                        };
+                        let _ = self.sys_munmap_raw(
+                            UserPtrMut::from_usize(cleanup_start),
+                            range.end - cleanup_start,
+                        );
+                    }
+                    return Err(error.into());
+                }
+            }
         };
 
-        let syscall_entry = self.global.platform.get_syscall_entry_point();
         if syscall_entry == 0 {
             return Ok(result);
         }
 
         let patch_key = ElfPatchKey(typed_fd);
+        let trampoline_reservation = reservation.map(|range| range.start + len..range.end);
+        let cleanup_len = trampoline_reservation
+            .as_ref()
+            .map_or(len, |range| range.end - result.as_usize());
 
         // Runtime syscall rewriting: patch PROT_EXEC segments in-place.
         if is_exec {
-            if !self.maybe_patch_exec_segment(result, len, &patch_key, syscall_entry, Some(offset))
-            {
+            if !self.maybe_patch_exec_segment(
+                result,
+                len,
+                &patch_key,
+                syscall_entry,
+                Some(offset),
+                trampoline_reservation,
+            ) {
                 // Trampoline setup failed for a pre-patched binary whose
                 // .text already contains JMPs to the trampoline address.
                 // Continuing would guarantee a SIGSEGV on the first
                 // rewritten syscall, so fail the mmap instead.
-                self.sys_munmap(result, len)?;
+                self.sys_munmap(result, cleanup_len)?;
                 return Err(Errno::ENOMEM);
             }
         } else {
             // Ensure patch state is initialized for this fd (no-op if already done).
             // A missing load base is not fatal here: a later mapping may reveal it.
-            if self.try_init_elf_patch_state(&patch_key, result.as_usize(), offset)
-                == ElfPatchInit::Malformed
+            if self.try_init_elf_patch_state(
+                &patch_key,
+                result.as_usize(),
+                offset,
+                trampoline_reservation,
+            ) == ElfPatchInit::Malformed
             {
-                self.sys_munmap(result, len)?;
+                self.sys_munmap(result, cleanup_len)?;
                 return Err(Errno::ENOMEM);
             }
             // Track non-exec file mappings so we can patch them if they later
@@ -313,17 +402,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
             Ok(copied)
         };
-        let fixed_addr = flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE);
-        let ptr = self.do_mmap(
-            suggested_addr,
-            len,
-            ProtFlags::PROT_READ_WRITE,
-            flags,
-            // Note we need to ensure that the space after the mapping is available
-            // so that we could load trampoline code right after the mapping.
-            offset == 0 && !fixed_addr,
-            op,
-        )?;
+        let ptr = self.do_mmap(suggested_addr, len, ProtFlags::PROT_READ_WRITE, flags, op)?;
         if prot != ProtFlags::PROT_READ_WRITE && self.sys_mprotect_raw(ptr, len, prot).is_err() {
             // TODO: Protection may be unsupported (e.g. write-only), or another thread may
             // have unmapped the range. Best-effort cleanup may unmap a replacement
@@ -556,7 +635,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 continue;
             }
             let mapped_addr = UserPtrMut::<u8>::from_usize(patch_start);
-            self.maybe_patch_exec_segment(mapped_addr, patch_len, &fd, syscall_entry, None);
+            self.maybe_patch_exec_segment(mapped_addr, patch_len, &fd, syscall_entry, None, None);
         }
     }
 
@@ -578,10 +657,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
         fd: &ElfPatchKey<Platform>,
         mapped_addr: usize,
         file_offset: usize,
+        runtime_trampoline_reservation: Option<Range<usize>>,
     ) -> ElfPatchInit {
         // Quick check: skip if already initialized.
         let mut cache = self.global.elf_patch_cache.lock();
-        if cache.contains_key(fd) {
+        if let Some(state) = cache.get_mut(fd) {
+            if runtime_trampoline_reservation.is_some() {
+                state.runtime_trampoline_reservation = runtime_trampoline_reservation;
+            }
             return ElfPatchInit::Ready;
         }
 
@@ -742,6 +825,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 trampoline_cursor: 0,
                 trampoline_mapped: false,
                 trampoline_mapped_len: 0,
+                runtime_trampoline_reservation,
                 runtime_patches_committed: false,
                 file_mappings: BTreeSet::new(),
                 patched_ranges: BTreeSet::new(),
@@ -838,6 +922,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         fd: &ElfPatchKey<Platform>,
         syscall_entry: usize,
         file_offset: Option<usize>,
+        runtime_trampoline_reservation: Option<Range<usize>>,
     ) -> bool {
         // Initialize patch state if this is the first mmap for this fd.
         // Typically the first mapping is at offset 0 (the ELF header), but
@@ -846,7 +931,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // first rewritten syscall, so both pre-patched failures are fatal here.
         if let Some(file_offset) = file_offset
             && matches!(
-                self.try_init_elf_patch_state(fd, mapped_addr.as_usize(), file_offset),
+                self.try_init_elf_patch_state(
+                    fd,
+                    mapped_addr.as_usize(),
+                    file_offset,
+                    runtime_trampoline_reservation,
+                ),
                 ElfPatchInit::MissingLoadBase | ElfPatchInit::Malformed
             )
         {
@@ -944,17 +1034,27 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let addr_usize = mapped_addr.as_usize();
         if !state.trampoline_mapped {
             let tramp_addr = state.trampoline_addr;
+            let tramp_end = tramp_addr.saturating_add(PAGE_SIZE);
+            let trampoline_is_reserved = state
+                .runtime_trampoline_reservation
+                .as_ref()
+                .is_some_and(|range| tramp_addr >= range.start && tramp_end <= range.end);
 
-            // Try MAP_FIXED_NOREPLACE first — works when the preferred
-            // trampoline address is available. If that fails, let the VM
-            // manager choose a free address and validate that it is still
-            // within JMP rel32 range below.
+            // Replace the inaccessible reservation when this mapping owns the range. Otherwise,
+            // preserve normal no-replace behavior at the preferred address.
+            let preferred_flags = MapFlags::MAP_ANONYMOUS
+                | MapFlags::MAP_PRIVATE
+                | if trampoline_is_reserved {
+                    MapFlags::MAP_FIXED
+                } else {
+                    MapFlags::MAP_FIXED_NOREPLACE
+                };
             let actual_addr = self
                 .do_mmap_anonymous(
                     Some(tramp_addr),
                     PAGE_SIZE,
                     ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-                    MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
+                    preferred_flags,
                 )
                 .or_else(|_| {
                     self.do_mmap_anonymous(
