@@ -6,7 +6,7 @@
 use std::cell::RefCell;
 
 use litebox::utils::{ReinterpretSignedExt, ReinterpretUnsignedExt as _, TruncateExt};
-use litebox_common::arch::x86_64::xstate::{XsaveArea, XsaveLayout};
+use litebox::arch::x86_64::xstate::{XsaveArea, XsaveLayout};
 
 use super::{
     LinuxUserland, ThreadContext, exception_handler, init_handler, interrupt_handler,
@@ -641,7 +641,7 @@ mod tests {
     fn spawned_guest_inherits_xstate() {
         use litebox::platform::ThreadProvider as _;
         use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo, InitThread};
-        use litebox_common::arch::x86_64::xstate::{XsaveArea, XsaveLayout, XsaveLegacyArea};
+        use litebox::arch::x86_64::xstate::{XsaveArea, XsaveLayout, XsaveLegacyArea};
         use litebox_common_linux::PtRegs;
         use std::sync::mpsc::{Sender, channel};
 
@@ -783,7 +783,7 @@ mod tests {
     #[test]
     fn xsave_preserves_state_across_guest_transitions() {
         use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
-        use litebox_common::arch::x86_64::xstate::{XsaveArea, XsaveLegacyArea};
+        use litebox::arch::x86_64::xstate::{XsaveArea, XsaveLegacyArea};
         use litebox_common_linux::PtRegs;
         use std::cell::Cell;
 

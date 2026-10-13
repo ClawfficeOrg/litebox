@@ -26,7 +26,7 @@ use litebox::platform::page_mgmt::{
 };
 use litebox::shim::{ContinueOperation, Exception};
 use litebox::utils::TruncateExt as _;
-use litebox_common::arch::x86_64::xstate::{XsaveArea, XsaveChunk, XsaveLayout, XsaveLegacyArea};
+use litebox::arch::x86_64::xstate::{XsaveArea, XsaveChunk, XsaveLayout, XsaveLegacyArea};
 
 use windows_sys::Win32::Foundation::{self as Win32_Foundation, FILETIME};
 use windows_sys::Win32::{
