@@ -40,6 +40,14 @@ use crate::timer::{
     CreateTimerResponse, GetTimerRequest, GetTimerResponse, ReadTimerRequest, ReadTimerResponse,
     SetTimerRequest, SetTimerResponse,
 };
+use crate::unix_socket::{
+    AcceptUnixSocketRequest, AcceptUnixSocketResponse, BindUnixSocketRequest,
+    ConnectUnixSocketRequest, CreateUnixSocketPairResponse, CreateUnixSocketRequest,
+    CreateUnixSocketResponse, GetUnixSocketNameRequest, GetUnixSocketNameResponse,
+    GetUnixSocketOptionRequest, GetUnixSocketOptionResponse, ListenUnixSocketRequest,
+    ReceiveUnixSocketRequest, ReceiveUnixSocketResponse, SendUnixSocketRequest,
+    SendUnixSocketResponse, SetUnixSocketOptionRequest, ShutdownUnixSocketRequest, UnixSocketError,
+};
 use crate::{ObjectHandle, ProcessId, ProtocolVersion, RequestId, ThreadId};
 
 /// Broker handshake request sent before the control channel is active.
@@ -80,6 +88,8 @@ pub enum BrokerOperation {
     Timer(TimerRequest),
     /// Signal request family.
     Signal(SignalRequest),
+    /// Unix socket request family.
+    UnixSocket(UnixSocketRequest),
 }
 
 impl BrokerOperation {
@@ -120,6 +130,17 @@ impl BrokerOperation {
                     startup: ProcessStartupDescriptor { buffer },
                     ..
                 }),
+            )
+            | Self::UnixSocket(
+                UnixSocketRequest::Bind(BindUnixSocketRequest {
+                    address: buffer, ..
+                })
+                | UnixSocketRequest::Connect(ConnectUnixSocketRequest {
+                    address: buffer, ..
+                })
+                | UnixSocketRequest::Send(SendUnixSocketRequest { buffer, .. })
+                | UnixSocketRequest::Receive(ReceiveUnixSocketRequest { buffer, .. })
+                | UnixSocketRequest::GetName(GetUnixSocketNameRequest { buffer, .. }),
             ) => Some(*buffer),
             Self::Thread(_)
             | Self::CloseObject(_)
@@ -158,6 +179,15 @@ impl BrokerOperation {
                 | FileRequest::Truncate(_)
                 | FileRequest::HandleStatus(_)
                 | FileRequest::IsTerminal(_),
+            )
+            | Self::UnixSocket(
+                UnixSocketRequest::Create(_)
+                | UnixSocketRequest::CreatePair(_)
+                | UnixSocketRequest::Listen(_)
+                | UnixSocketRequest::Accept(_)
+                | UnixSocketRequest::Shutdown(_)
+                | UnixSocketRequest::SetOption(_)
+                | UnixSocketRequest::GetOption(_),
             ) => None,
         }
     }
@@ -331,6 +361,35 @@ pub enum PipeRequest {
     Write(WritePipeRequest),
 }
 
+/// Broker-owned Unix socket request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UnixSocketRequest {
+    /// Create an unbound, unconnected socket.
+    Create(CreateUnixSocketRequest),
+    /// Create a pair of connected unnamed sockets.
+    CreatePair(CreateUnixSocketRequest),
+    /// Bind a socket to a name.
+    Bind(BindUnixSocketRequest),
+    /// Make a bound stream socket accept connections.
+    Listen(ListenUnixSocketRequest),
+    /// Connect a socket to a named socket.
+    Connect(ConnectUnixSocketRequest),
+    /// Accept one pending connection.
+    Accept(AcceptUnixSocketRequest),
+    /// Send bytes staged in shared memory.
+    Send(SendUnixSocketRequest),
+    /// Receive bytes into shared memory.
+    Receive(ReceiveUnixSocketRequest),
+    /// Shut down one or both directions.
+    Shutdown(ShutdownUnixSocketRequest),
+    /// Read the name of a socket or its peer.
+    GetName(GetUnixSocketNameRequest),
+    /// Store one socket option.
+    SetOption(SetUnixSocketOptionRequest),
+    /// Read one socket option.
+    GetOption(GetUnixSocketOptionRequest),
+}
+
 /// Broker-owned socket object request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SocketRequest {
@@ -393,6 +452,8 @@ pub enum BrokerResult {
     Timer(TimerResponse),
     /// Signal response family.
     Signal(SignalResponse),
+    /// Unix socket response family.
+    UnixSocket(UnixSocketResponse),
     /// Operation failed with an ABI-neutral broker error.
     Error(ErrorCode),
 }
@@ -538,6 +599,40 @@ pub enum SocketResponse {
     ///
     /// [`SocketConnectionStatus`]: crate::socket::SocketConnectionStatus
     Failed(SocketError),
+}
+
+/// Broker-owned Unix socket response.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UnixSocketResponse {
+    /// Create operation response.
+    Create(CreateUnixSocketResponse),
+    /// Pair create operation response.
+    CreatePair(CreateUnixSocketPairResponse),
+    /// Bind operation completed.
+    Bind,
+    /// Listen operation completed.
+    Listen,
+    /// Connect operation completed.
+    Connect,
+    /// Accept operation response.
+    Accept(AcceptUnixSocketResponse),
+    /// Send operation response.
+    Send(SendUnixSocketResponse),
+    /// Receive operation response.
+    Receive(ReceiveUnixSocketResponse),
+    /// Shutdown operation completed.
+    Shutdown,
+    /// Name operation response.
+    GetName(GetUnixSocketNameResponse),
+    /// Option was stored.
+    SetOption,
+    /// Option read response.
+    GetOption(GetUnixSocketOptionResponse),
+    /// The operation failed in a way the guest ABI reports.
+    ///
+    /// Waiting, resource, and request-validation failures use
+    /// [`BrokerResult::Error`] instead.
+    Failed(UnixSocketError),
 }
 
 /// Broker-owned fs request.

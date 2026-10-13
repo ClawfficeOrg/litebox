@@ -30,9 +30,15 @@ use litebox_broker_protocol::socket::{
     AcceptSocketResponse, MAX_SOCKET_TRANSFER_SIZE, MAX_UDP_DATAGRAM_SIZE,
     ReceiveFlags as BrokerReceiveFlags, ReceiveFromFlags as BrokerReceiveFromFlags,
     ReceiveFromSocketResponse, ReceiveSocketResponse, SendFlags as BrokerSendFlags, ShutdownMode,
-    SocketConnectionStatus, SocketOutcome, SocketStatusResponse, TcpOptionName, TcpOptionValue,
+    SocketConnectionStatus, SocketOutcome, SocketStatusResponse, SocketType, TcpOptionName,
+    TcpOptionValue,
 };
 use litebox_broker_protocol::timer::TimerSpec;
+use litebox_broker_protocol::unix_socket::{
+    CreateUnixSocketPairResponse, MAX_ENCODED_UNIX_SOCKET_NAME_SIZE, MAX_UNIX_SOCKET_TRANSFER_SIZE,
+    ReceiveUnixSocketResponse, UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress, UnixSocketError,
+    UnixSocketName, UnixSocketOptionName, UnixSocketOptionValue,
+};
 use litebox_broker_transport::channel::LocalCallChannel;
 use litebox_platform::time::TimeProvider;
 
@@ -387,6 +393,101 @@ pub(crate) trait BrokerControl: Send + Sync {
         path: &str,
         user: FileUser,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError>;
+
+    fn create_unix_socket(
+        &self,
+        socket_type: SocketType,
+        flags: FileOpenFlags,
+    ) -> core::result::Result<ObjectHandle, BrokerControlError>;
+
+    fn create_unix_socket_pair(
+        &self,
+        socket_type: SocketType,
+        flags: FileOpenFlags,
+    ) -> core::result::Result<CreateUnixSocketPairResponse, BrokerControlError>;
+
+    fn bind_unix_socket(
+        &self,
+        handle: ObjectHandle,
+        address: &UnixSocketAddress,
+        user: FileUser,
+        mode: FileMode,
+    ) -> core::result::Result<core::result::Result<(), UnixSocketError>, BrokerControlError>;
+
+    fn listen_unix_socket(
+        &self,
+        handle: ObjectHandle,
+        backlog: u32,
+    ) -> core::result::Result<core::result::Result<(), UnixSocketError>, BrokerControlError>;
+
+    fn connect_unix_socket(
+        &self,
+        handle: ObjectHandle,
+        address: &UnixSocketAddress,
+        user: FileUser,
+    ) -> core::result::Result<core::result::Result<(), UnixSocketError>, BrokerControlError>;
+
+    fn accept_unix_socket(
+        &self,
+        handle: ObjectHandle,
+        flags: FileOpenFlags,
+    ) -> core::result::Result<core::result::Result<ObjectHandle, UnixSocketError>, BrokerControlError>;
+
+    /// Sends `data` to `address`, or to the connected peer if `address` is
+    /// `None`.
+    ///
+    /// Data that does not fit in one transfer fails with
+    /// [`UnixSocketError::MessageTooLarge`], so stream callers send it in
+    /// chunks of at most [`UNIX_SOCKET_BUFFER_SIZE`] bytes.
+    fn send_unix_socket(
+        &self,
+        handle: ObjectHandle,
+        address: Option<&UnixSocketAddress>,
+        data: &[u8],
+        user: FileUser,
+    ) -> core::result::Result<core::result::Result<usize, UnixSocketError>, BrokerControlError>;
+
+    /// Receives into at most [`UNIX_SOCKET_BUFFER_SIZE`] bytes of `data`, as
+    /// for a non-blocking socket if `nonblocking` is set, returning the
+    /// sender's name if `source` is set.
+    fn receive_unix_socket(
+        &self,
+        handle: ObjectHandle,
+        data: &mut [u8],
+        peek: bool,
+        source: bool,
+        nonblocking: bool,
+    ) -> core::result::Result<
+        core::result::Result<(ReceiveUnixSocketResponse, Option<UnixSocketName>), UnixSocketError>,
+        BrokerControlError,
+    >;
+
+    fn shutdown_unix_socket(
+        &self,
+        handle: ObjectHandle,
+        mode: ShutdownMode,
+    ) -> core::result::Result<core::result::Result<(), UnixSocketError>, BrokerControlError>;
+
+    fn unix_socket_name(
+        &self,
+        handle: ObjectHandle,
+        peer: bool,
+    ) -> core::result::Result<
+        core::result::Result<UnixSocketName, UnixSocketError>,
+        BrokerControlError,
+    >;
+
+    fn set_unix_socket_option(
+        &self,
+        handle: ObjectHandle,
+        value: UnixSocketOptionValue,
+    ) -> core::result::Result<(), BrokerControlError>;
+
+    fn get_unix_socket_option(
+        &self,
+        handle: ObjectHandle,
+        name: UnixSocketOptionName,
+    ) -> core::result::Result<UnixSocketOptionValue, BrokerControlError>;
 
     fn close_object(&self, handle: ObjectHandle) -> core::result::Result<(), BrokerControlError>;
 
@@ -1138,6 +1239,148 @@ where
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
         let lease = self.acquire_file_path_buffer(path)?;
         self.request(|local| local.rmdir_file(lease.sequence(), path, user))
+    }
+
+    fn create_unix_socket(
+        &self,
+        socket_type: SocketType,
+        flags: FileOpenFlags,
+    ) -> core::result::Result<ObjectHandle, BrokerControlError> {
+        self.request(|local| local.create_unix_socket(socket_type, flags))
+    }
+
+    fn create_unix_socket_pair(
+        &self,
+        socket_type: SocketType,
+        flags: FileOpenFlags,
+    ) -> core::result::Result<CreateUnixSocketPairResponse, BrokerControlError> {
+        self.request(|local| local.create_unix_socket_pair(socket_type, flags))
+    }
+
+    fn bind_unix_socket(
+        &self,
+        handle: ObjectHandle,
+        address: &UnixSocketAddress,
+        user: FileUser,
+        mode: FileMode,
+    ) -> core::result::Result<core::result::Result<(), UnixSocketError>, BrokerControlError> {
+        let Some(address) = address.encode() else {
+            return Ok(Err(UnixSocketError::InvalidArgument));
+        };
+        let lease = self.acquire_shared_buffer(address.len())?;
+        self.request(|local| local.bind_unix_socket(handle, lease.sequence(), &address, user, mode))
+    }
+
+    fn listen_unix_socket(
+        &self,
+        handle: ObjectHandle,
+        backlog: u32,
+    ) -> core::result::Result<core::result::Result<(), UnixSocketError>, BrokerControlError> {
+        self.request(|local| local.listen_unix_socket(handle, backlog))
+    }
+
+    fn connect_unix_socket(
+        &self,
+        handle: ObjectHandle,
+        address: &UnixSocketAddress,
+        user: FileUser,
+    ) -> core::result::Result<core::result::Result<(), UnixSocketError>, BrokerControlError> {
+        let Some(address) = address.encode() else {
+            return Ok(Err(UnixSocketError::InvalidArgument));
+        };
+        let lease = self.acquire_shared_buffer(address.len())?;
+        self.request(|local| local.connect_unix_socket(handle, lease.sequence(), &address, user))
+    }
+
+    fn accept_unix_socket(
+        &self,
+        handle: ObjectHandle,
+        flags: FileOpenFlags,
+    ) -> core::result::Result<core::result::Result<ObjectHandle, UnixSocketError>, BrokerControlError>
+    {
+        self.request(|local| local.accept_unix_socket(handle, flags))
+    }
+
+    fn send_unix_socket(
+        &self,
+        handle: ObjectHandle,
+        address: Option<&UnixSocketAddress>,
+        data: &[u8],
+        user: FileUser,
+    ) -> core::result::Result<core::result::Result<usize, UnixSocketError>, BrokerControlError>
+    {
+        let address = match address {
+            Some(address) => match address.encode() {
+                Some(address) => address,
+                None => return Ok(Err(UnixSocketError::InvalidArgument)),
+            },
+            None => Vec::new(),
+        };
+        if data.len() > MAX_UNIX_SOCKET_TRANSFER_SIZE as usize - address.len() {
+            return Ok(Err(UnixSocketError::MessageTooLarge));
+        }
+        let lease = self.acquire_shared_buffer(address.len() + data.len())?;
+        self.request(|local| local.send_unix_socket(handle, lease.sequence(), &address, data, user))
+    }
+
+    fn receive_unix_socket(
+        &self,
+        handle: ObjectHandle,
+        data: &mut [u8],
+        peek: bool,
+        source: bool,
+        nonblocking: bool,
+    ) -> core::result::Result<
+        core::result::Result<(ReceiveUnixSocketResponse, Option<UnixSocketName>), UnixSocketError>,
+        BrokerControlError,
+    > {
+        let capacity = data.len().min(UNIX_SOCKET_BUFFER_SIZE as usize);
+        let data = &mut data[..capacity];
+        let name_size = if source {
+            MAX_ENCODED_UNIX_SOCKET_NAME_SIZE as usize
+        } else {
+            0
+        };
+        let lease = self.acquire_shared_buffer(capacity + name_size)?;
+        self.request(|local| {
+            local.receive_unix_socket(handle, lease.sequence(), data, peek, source, nonblocking)
+        })
+    }
+
+    fn shutdown_unix_socket(
+        &self,
+        handle: ObjectHandle,
+        mode: ShutdownMode,
+    ) -> core::result::Result<core::result::Result<(), UnixSocketError>, BrokerControlError> {
+        self.request(|local| local.shutdown_unix_socket(handle, mode))
+    }
+
+    fn unix_socket_name(
+        &self,
+        handle: ObjectHandle,
+        peer: bool,
+    ) -> core::result::Result<
+        core::result::Result<UnixSocketName, UnixSocketError>,
+        BrokerControlError,
+    > {
+        let lease = self.acquire_shared_buffer(MAX_ENCODED_UNIX_SOCKET_NAME_SIZE as usize)?;
+        self.request(|local| local.unix_socket_name(handle, peer, lease.sequence()))
+    }
+
+    fn set_unix_socket_option(
+        &self,
+        handle: ObjectHandle,
+        value: UnixSocketOptionValue,
+    ) -> core::result::Result<(), BrokerControlError> {
+        self.request(|local| local.set_unix_socket_option(handle, value))
+    }
+
+    fn get_unix_socket_option(
+        &self,
+        handle: ObjectHandle,
+        name: UnixSocketOptionName,
+    ) -> core::result::Result<UnixSocketOptionValue, BrokerControlError> {
+        self.request(|local| local.get_unix_socket_option(handle, name))
     }
 
     fn close_object(&self, handle: ObjectHandle) -> core::result::Result<(), BrokerControlError> {

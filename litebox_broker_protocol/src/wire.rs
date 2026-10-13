@@ -37,6 +37,7 @@ mod signal;
 mod socket;
 mod thread;
 mod timer;
+mod unix_socket;
 
 const REQUEST_TAG_NEGOTIATE: u8 = 0;
 const REQUEST_TAG_EVENT: u8 = 1;
@@ -53,6 +54,7 @@ const REQUEST_TAG_GET_STATUS_FLAGS: u8 = 11;
 const REQUEST_TAG_SET_STATUS_FLAGS: u8 = 12;
 const REQUEST_TAG_SIGNAL: u8 = 13;
 const REQUEST_TAG_PROCESS_GROUP: u8 = 14;
+const REQUEST_TAG_UNIX_SOCKET: u8 = 15;
 
 // Paired request and successful-response tags intentionally share values.
 const RESPONSE_TAG_NEGOTIATED: u8 = 0;
@@ -70,6 +72,7 @@ const RESPONSE_TAG_STATUS_FLAGS: u8 = 11;
 const RESPONSE_TAG_STATUS_FLAGS_SET: u8 = 12;
 const RESPONSE_TAG_SIGNAL: u8 = 13;
 const RESPONSE_TAG_PROCESS_GROUP: u8 = 14;
+const RESPONSE_TAG_UNIX_SOCKET: u8 = 15;
 
 // Reserve the top of the tag space for responses without paired requests.
 const RESPONSE_TAG_ERROR: u8 = 253;
@@ -132,7 +135,8 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, 
         | REQUEST_TAG_GET_STATUS_FLAGS
         | REQUEST_TAG_SET_STATUS_FLAGS
         | REQUEST_TAG_SIGNAL
-        | REQUEST_TAG_PROCESS_GROUP => {
+        | REQUEST_TAG_PROCESS_GROUP
+        | REQUEST_TAG_UNIX_SOCKET => {
             return Err(WireError::WrongMessagePhase);
         }
         _ => return Err(WireError::InvalidTag),
@@ -222,6 +226,11 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
             encoder.request_id(request_id);
             signal::encode_signal_request(&mut encoder, request);
         }
+        BrokerOperation::UnixSocket(request) => {
+            encoder.u8(REQUEST_TAG_UNIX_SOCKET);
+            encoder.request_id(request_id);
+            unix_socket::encode_unix_socket_request(&mut encoder, request);
+        }
     }
     encoder.finish()
 }
@@ -245,7 +254,8 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         | REQUEST_TAG_GET_STATUS_FLAGS
         | REQUEST_TAG_SET_STATUS_FLAGS
         | REQUEST_TAG_SIGNAL
-        | REQUEST_TAG_PROCESS_GROUP => {}
+        | REQUEST_TAG_PROCESS_GROUP
+        | REQUEST_TAG_UNIX_SOCKET => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -270,6 +280,9 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         ),
         REQUEST_TAG_TIMER => BrokerOperation::Timer(timer::decode_timer_request(&mut decoder)?),
         REQUEST_TAG_SIGNAL => BrokerOperation::Signal(signal::decode_signal_request(&mut decoder)?),
+        REQUEST_TAG_UNIX_SOCKET => {
+            BrokerOperation::UnixSocket(unix_socket::decode_unix_socket_request(&mut decoder)?)
+        }
         _ => unreachable!("active request tag was validated"),
     };
     decoder.finish()?;
@@ -349,7 +362,8 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         | RESPONSE_TAG_STATUS_FLAGS
         | RESPONSE_TAG_STATUS_FLAGS_SET
         | RESPONSE_TAG_SIGNAL
-        | RESPONSE_TAG_PROCESS_GROUP => {
+        | RESPONSE_TAG_PROCESS_GROUP
+        | RESPONSE_TAG_UNIX_SOCKET => {
             return Err(WireError::WrongMessagePhase);
         }
         RESPONSE_TAG_VERSION_MISMATCH => BrokerHandshakeResponse::VersionMismatch {
@@ -439,6 +453,11 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
             encoder.request_id(request_id);
             signal::encode_signal_response(&mut encoder, response);
         }
+        BrokerResult::UnixSocket(response) => {
+            encoder.u8(RESPONSE_TAG_UNIX_SOCKET);
+            encoder.request_id(request_id);
+            unix_socket::encode_unix_socket_response(&mut encoder, response);
+        }
         BrokerResult::Error(error) => {
             encoder.u8(RESPONSE_TAG_ERROR);
             encoder.request_id(request_id);
@@ -470,7 +489,8 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         | RESPONSE_TAG_STATUS_FLAGS
         | RESPONSE_TAG_STATUS_FLAGS_SET
         | RESPONSE_TAG_SIGNAL
-        | RESPONSE_TAG_PROCESS_GROUP => {}
+        | RESPONSE_TAG_PROCESS_GROUP
+        | RESPONSE_TAG_UNIX_SOCKET => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -496,6 +516,9 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         }
         RESPONSE_TAG_TIMER => BrokerResult::Timer(timer::decode_timer_response(&mut decoder)?),
         RESPONSE_TAG_SIGNAL => BrokerResult::Signal(signal::decode_signal_response(&mut decoder)?),
+        RESPONSE_TAG_UNIX_SOCKET => {
+            BrokerResult::UnixSocket(unix_socket::decode_unix_socket_response(&mut decoder)?)
+        }
         _ => unreachable!("active response tag was validated"),
     };
     decoder.finish()?;
@@ -590,7 +613,7 @@ mod tests {
         EventRequest, EventResponse, FileRequest, FileResponse, PipeRequest, PipeResponse,
         ProcessGroupRequest, ProcessGroupResponse, ProcessRequest, ProcessResponse, SignalRequest,
         SignalResponse, SocketRequest, SocketResponse, ThreadRequest, ThreadResponse, TimerRequest,
-        TimerResponse,
+        TimerResponse, UnixSocketRequest, UnixSocketResponse,
     };
     use crate::pipe::{
         CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
@@ -624,6 +647,15 @@ mod tests {
     use crate::timer::{
         CreateTimerResponse, GetTimerRequest, GetTimerResponse, ReadTimerRequest,
         ReadTimerResponse, SetTimerRequest, SetTimerResponse, TimerSpec,
+    };
+    use crate::unix_socket::{
+        AcceptUnixSocketRequest, AcceptUnixSocketResponse, BindUnixSocketRequest,
+        ConnectUnixSocketRequest, CreateUnixSocketPairResponse, CreateUnixSocketRequest,
+        CreateUnixSocketResponse, GetUnixSocketNameRequest, GetUnixSocketNameResponse,
+        GetUnixSocketOptionRequest, GetUnixSocketOptionResponse, ListenUnixSocketRequest,
+        ReceiveUnixSocketRequest, ReceiveUnixSocketResponse, SendUnixSocketRequest,
+        SendUnixSocketResponse, SetUnixSocketOptionRequest, ShutdownUnixSocketRequest,
+        UnixSocketError, UnixSocketOptionName, UnixSocketOptionValue,
     };
     use crate::{
         ObjectHandle, ProcessGroupId, ProcessId, ProtocolVersion, RequestId, SessionId, ThreadId,
@@ -672,6 +704,7 @@ mod tests {
                 RESPONSE_TAG_STATUS_FLAGS_SET,
                 RESPONSE_TAG_SIGNAL,
                 RESPONSE_TAG_PROCESS_GROUP,
+                RESPONSE_TAG_UNIX_SOCKET,
             ],
             [
                 REQUEST_TAG_NEGOTIATE,
@@ -689,10 +722,11 @@ mod tests {
                 REQUEST_TAG_SET_STATUS_FLAGS,
                 REQUEST_TAG_SIGNAL,
                 REQUEST_TAG_PROCESS_GROUP,
+                REQUEST_TAG_UNIX_SOCKET,
             ]
         );
         // Top-level tags are consecutive.
-        assert_eq!(REQUEST_TAG_PROCESS_GROUP, 14);
+        assert_eq!(REQUEST_TAG_UNIX_SOCKET, 15);
         assert_eq!(
             [
                 RESPONSE_TAG_ERROR,
@@ -1023,6 +1057,78 @@ mod tests {
             )),
             BrokerOperation::Process(ProcessRequest::GetInfo(process_id(u32::MAX))),
             BrokerOperation::Process(ProcessRequest::GetThreadInfo(thread_id(u32::MAX))),
+            BrokerOperation::UnixSocket(UnixSocketRequest::Create(CreateUnixSocketRequest {
+                socket_type: SocketType::Stream,
+                flags: FileOpenFlags::NONBLOCKING,
+            })),
+            BrokerOperation::UnixSocket(UnixSocketRequest::CreatePair(CreateUnixSocketRequest {
+                socket_type: SocketType::Datagram,
+                flags: FileOpenFlags::NONE,
+            })),
+            BrokerOperation::UnixSocket(UnixSocketRequest::Bind(BindUnixSocketRequest {
+                handle,
+                address: largest_sequence,
+                user: FileUser {
+                    user: 1000,
+                    group: u16::MAX,
+                },
+                mode: FileMode::from_bits(0o755).unwrap(),
+            })),
+            BrokerOperation::UnixSocket(UnixSocketRequest::Listen(ListenUnixSocketRequest {
+                handle,
+                backlog: u32::MAX,
+            })),
+            BrokerOperation::UnixSocket(UnixSocketRequest::Connect(ConnectUnixSocketRequest {
+                handle,
+                address: largest_sequence,
+                user: FileUser { user: 0, group: 0 },
+            })),
+            BrokerOperation::UnixSocket(UnixSocketRequest::Accept(AcceptUnixSocketRequest {
+                handle,
+                flags: FileOpenFlags::NONBLOCKING,
+            })),
+            BrokerOperation::UnixSocket(UnixSocketRequest::Send(SendUnixSocketRequest {
+                handle,
+                buffer: largest_sequence,
+                address_length: u32::MAX,
+                user: FileUser { user: 1, group: 2 },
+            })),
+            BrokerOperation::UnixSocket(UnixSocketRequest::Receive(ReceiveUnixSocketRequest {
+                handle,
+                buffer: largest_sequence,
+                capacity: u32::MAX,
+                peek: true,
+                source: true,
+                nonblocking: true,
+            })),
+            BrokerOperation::UnixSocket(UnixSocketRequest::Shutdown(ShutdownUnixSocketRequest {
+                handle,
+                mode: ShutdownMode::Both,
+            })),
+            BrokerOperation::UnixSocket(UnixSocketRequest::GetName(GetUnixSocketNameRequest {
+                handle,
+                peer: true,
+                buffer: largest_sequence,
+            })),
+            BrokerOperation::UnixSocket(UnixSocketRequest::SetOption(SetUnixSocketOptionRequest {
+                handle,
+                value: UnixSocketOptionValue::ReceiveTimeout(Some(core::time::Duration::new(
+                    u64::MAX,
+                    999_999_999,
+                ))),
+            })),
+            BrokerOperation::UnixSocket(UnixSocketRequest::SetOption(SetUnixSocketOptionRequest {
+                handle,
+                value: UnixSocketOptionValue::Linger(None),
+            })),
+            BrokerOperation::UnixSocket(UnixSocketRequest::SetOption(SetUnixSocketOptionRequest {
+                handle,
+                value: UnixSocketOptionValue::Broadcast(true),
+            })),
+            BrokerOperation::UnixSocket(UnixSocketRequest::GetOption(GetUnixSocketOptionRequest {
+                handle,
+                name: UnixSocketOptionName::SendTimeout,
+            })),
         ];
         let mut maximum_encoded_size = 0;
 
@@ -1261,6 +1367,49 @@ mod tests {
             BrokerResult::Timer(TimerResponse::Read(ReadTimerResponse {
                 expirations: u64::MAX,
             })),
+            BrokerResult::UnixSocket(UnixSocketResponse::Create(CreateUnixSocketResponse {
+                handle,
+            })),
+            BrokerResult::UnixSocket(UnixSocketResponse::CreatePair(
+                CreateUnixSocketPairResponse {
+                    first: handle,
+                    second: ObjectHandle(u64::MAX),
+                },
+            )),
+            BrokerResult::UnixSocket(UnixSocketResponse::Bind),
+            BrokerResult::UnixSocket(UnixSocketResponse::Listen),
+            BrokerResult::UnixSocket(UnixSocketResponse::Connect),
+            BrokerResult::UnixSocket(UnixSocketResponse::Accept(AcceptUnixSocketResponse {
+                handle,
+            })),
+            BrokerResult::UnixSocket(UnixSocketResponse::Send(SendUnixSocketResponse {
+                sent: u32::MAX,
+            })),
+            BrokerResult::UnixSocket(UnixSocketResponse::Receive(ReceiveUnixSocketResponse {
+                received: 1,
+                length: u32::MAX,
+                source_length: 109,
+            })),
+            BrokerResult::UnixSocket(UnixSocketResponse::Shutdown),
+            BrokerResult::UnixSocket(UnixSocketResponse::GetName(GetUnixSocketNameResponse {
+                length: 3,
+            })),
+            BrokerResult::UnixSocket(UnixSocketResponse::SetOption),
+            BrokerResult::UnixSocket(UnixSocketResponse::GetOption(GetUnixSocketOptionResponse {
+                value: UnixSocketOptionValue::ReceiveTimeout(Some(core::time::Duration::new(
+                    u64::MAX,
+                    1,
+                ))),
+            })),
+            BrokerResult::UnixSocket(UnixSocketResponse::GetOption(GetUnixSocketOptionResponse {
+                value: UnixSocketOptionValue::KeepAlive(false),
+            })),
+            BrokerResult::UnixSocket(UnixSocketResponse::Failed(UnixSocketError::AddressInUse)),
+            BrokerResult::UnixSocket(UnixSocketResponse::Failed(UnixSocketError::NotPermitted)),
+            BrokerResult::UnixSocket(UnixSocketResponse::Failed(UnixSocketError::ConnectionReset)),
+            BrokerResult::UnixSocket(UnixSocketResponse::Failed(UnixSocketError::File(
+                FileError::NoSuchFileOrDirectory,
+            ))),
             BrokerResult::Signal(SignalResponse::Open(OpenSignalsResponse { handle })),
             BrokerResult::Signal(SignalResponse::Sent),
             BrokerResult::Signal(SignalResponse::Take(SignalEvent::Signal(PendingSignal {

@@ -13,6 +13,7 @@ use core::ops::Range;
 use litebox::pipes::HalfPipeType;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::process::MAX_PROCESS_BOOTSTRAP_SIZE;
+use litebox_broker_protocol::socket::SocketType;
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::GuestVectorState;
@@ -27,6 +28,7 @@ const INHERITED_FD_HEADER_SIZE: usize = size_of::<u32>() + size_of::<u64>() + si
 const FORK_REGION_SIZE: usize = size_of::<[u64; 2]>() + size_of::<u32>();
 const FILE_TAG: u8 = 0;
 const PIPE_TAG: u8 = 1;
+const UNIX_SOCKET_TAG: u8 = 2;
 const PROGRAM_STARTUP_TAG: u8 = 0;
 const FORK_STARTUP_TAG: u8 = 1;
 
@@ -113,6 +115,11 @@ pub enum InheritedFdKind {
     Pipe {
         /// Which end.
         endpoint: HalfPipeType,
+    },
+    /// A Unix domain socket.
+    UnixSocket {
+        /// Stream or datagram.
+        socket_type: SocketType,
     },
 }
 
@@ -516,7 +523,9 @@ impl InheritedFd {
         INHERITED_FD_HEADER_SIZE
             + match self.kind {
                 InheritedFdKind::File => 0,
-                InheritedFdKind::Pipe { .. } => size_of::<u8>(),
+                InheritedFdKind::Pipe { .. } | InheritedFdKind::UnixSocket { .. } => {
+                    size_of::<u8>()
+                }
             }
     }
 
@@ -525,6 +534,14 @@ impl InheritedFd {
         push_u64(output, self.handle.0);
         match self.kind {
             InheritedFdKind::File => output.push(FILE_TAG),
+            InheritedFdKind::UnixSocket { socket_type } => {
+                output.push(UNIX_SOCKET_TAG);
+                output.push(match socket_type {
+                    SocketType::Stream => 0,
+                    SocketType::Datagram => 1,
+                    _ => unreachable!("Unix sockets are streams or datagrams"),
+                });
+            }
             InheritedFdKind::Pipe { endpoint } => {
                 output.push(PIPE_TAG);
                 output.push(match endpoint {
@@ -540,6 +557,13 @@ impl InheritedFd {
         let handle = ObjectHandle(read_u64(input)?);
         let kind = match read_u8(input)? {
             FILE_TAG => InheritedFdKind::File,
+            UNIX_SOCKET_TAG => InheritedFdKind::UnixSocket {
+                socket_type: match read_u8(input)? {
+                    0 => SocketType::Stream,
+                    1 => SocketType::Datagram,
+                    _ => return Err(LinuxProgramStartupError::Malformed),
+                },
+            },
             PIPE_TAG => InheritedFdKind::Pipe {
                 endpoint: match read_u8(input)? {
                     0 => HalfPipeType::ReceiverHalf,
@@ -762,6 +786,13 @@ mod tests {
                         endpoint: HalfPipeType::SenderHalf,
                     },
                 },
+                InheritedFd {
+                    fd: 7,
+                    handle: ObjectHandle(10),
+                    kind: InheritedFdKind::UnixSocket {
+                        socket_type: SocketType::Datagram,
+                    },
+                },
             ],
         };
 
@@ -880,6 +911,16 @@ mod tests {
                         },
                     },
                     close_on_exec: true,
+                },
+                ForkedFd {
+                    inherited: InheritedFd {
+                        fd: 4,
+                        handle: ObjectHandle(9),
+                        kind: InheritedFdKind::UnixSocket {
+                            socket_type: SocketType::Stream,
+                        },
+                    },
+                    close_on_exec: false,
                 },
             ],
         }

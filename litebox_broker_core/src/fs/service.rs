@@ -473,6 +473,34 @@ pub fn open(
         .map(Ok)
 }
 
+/// Opens `path` for broker-internal use, returning the open file and its
+/// status without installing a reference.
+///
+/// Requires the same rights as [`open`]. Dropping the file can reach the
+/// backend, so callers drop it outside their locks.
+pub(crate) fn open_without_reference(
+    process: &BrokerProcess,
+    path: &str,
+    user: FileUser,
+    access: FileAccessMode,
+    flags: FileOpenFlags,
+    mode: FileMode,
+) -> Result<FileResult<(File, FileStatus)>> {
+    authorize(process, open_required_rights(access, flags)?)?;
+    if let Err(error) = validate_path(path) {
+        return Ok(Err(error));
+    }
+    let file = match process.core.fs.open(path, user, access, flags, mode)? {
+        Ok(file) => file,
+        Err(error) => return Ok(Err(error)),
+    };
+    let status = match process.core.fs.handle_status(&file)? {
+        Ok(status) => status,
+        Err(error) => return Ok(Err(error)),
+    };
+    Ok(Ok((file, status)))
+}
+
 /// Reads bytes from a broker-owned open file.
 ///
 /// Fails with [`BrokerError::WouldBlock`] while a file that publishes readiness has nothing to

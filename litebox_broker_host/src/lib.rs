@@ -24,6 +24,7 @@ extern crate std;
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 
 use litebox_broker_core::readiness::ReadinessSink;
+use litebox_broker_core::unix_socket::UnixSocketResult;
 use litebox_broker_core::{
     BrokerCore, BrokerError, BrokerProcess, CallerCredential, ChildImage, ProcessImage,
 };
@@ -42,7 +43,7 @@ use litebox_broker_protocol::message::{
     EventRequest, EventResponse, FileRequest, FileResponse, PipeRequest, PipeResponse,
     ProcessGroupRequest, ProcessGroupResponse, ProcessRequest, ProcessResponse, SignalRequest,
     SignalResponse, SocketRequest, SocketResponse, ThreadRequest, ThreadResponse, TimerRequest,
-    TimerResponse,
+    TimerResponse, UnixSocketRequest, UnixSocketResponse,
 };
 use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
@@ -66,6 +67,12 @@ use litebox_broker_protocol::socket::{
 };
 use litebox_broker_protocol::timer::{
     CreateTimerResponse, GetTimerResponse, ReadTimerResponse, SetTimerResponse,
+};
+use litebox_broker_protocol::unix_socket::{
+    AcceptUnixSocketResponse, CreateUnixSocketPairResponse, CreateUnixSocketResponse,
+    GetUnixSocketNameResponse, GetUnixSocketOptionResponse, MAX_ENCODED_UNIX_SOCKET_ADDRESS_SIZE,
+    MAX_ENCODED_UNIX_SOCKET_NAME_SIZE, MAX_UNIX_SOCKET_TRANSFER_SIZE, ReceiveUnixSocketResponse,
+    SendUnixSocketResponse, UnixSocketAddress, UnixSocketError,
 };
 use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, ObjectHandle, ProcessId, RequestId};
 use litebox_broker_transport::channel::{HostReceive, HostSetupChannel, PeerCredential};
@@ -535,6 +542,10 @@ fn handle_request<Memory: SharedMemory>(
             handle_socket_request(process, request, shared_buffers, readiness_sink)
                 .map(BrokerResult::Socket)
         }
+        BrokerOperation::UnixSocket(request) => {
+            handle_unix_socket_request(process, request, shared_buffers, readiness_sink)
+                .map(BrokerResult::UnixSocket)
+        }
         BrokerOperation::FillRandom(buffer) => {
             validate_shared_buffer(buffer, MAX_RANDOM_TRANSFER_SIZE)?;
             let length = buffer.length() as usize;
@@ -907,7 +918,7 @@ pub fn read_shared_buffer<Memory: SharedMemory>(
     validate_shared_buffer(buffer, max_length)?;
     let mut data = allocate_zeroed(buffer.length() as usize)?;
     shared_buffers
-        .read_sequence(buffer, &mut data)
+        .read_sequence(buffer, 0, &mut data)
         .map_err(shared_buffer_access_failure)?;
     Ok(data)
 }
@@ -1062,7 +1073,7 @@ fn write_shared_buffer<Memory: SharedMemory>(
 ) -> RequestResult<()> {
     validate_shared_buffer(buffer, max_length)?;
     shared_buffers
-        .write_sequence(buffer, data)
+        .write_sequence(buffer, 0, data)
         .map_err(shared_buffer_access_failure)
 }
 
@@ -1372,6 +1383,208 @@ fn handle_pipe_request<Memory: SharedMemory>(
     }
 }
 
+fn handle_unix_socket_request<Memory: SharedMemory>(
+    process: &BrokerProcess,
+    request: UnixSocketRequest,
+    shared_buffers: &SharedBufferPool<Memory>,
+    readiness_sink: &Arc<dyn ReadinessSink>,
+) -> RequestResult<UnixSocketResponse> {
+    use litebox_broker_core::unix_socket;
+
+    match request {
+        UnixSocketRequest::Create(request) => {
+            let handle =
+                unix_socket::create(process, request.socket_type, request.flags, readiness_sink)?;
+            Ok(UnixSocketResponse::Create(CreateUnixSocketResponse {
+                handle,
+            }))
+        }
+        UnixSocketRequest::CreatePair(request) => {
+            let (first, second) = unix_socket::create_pair(
+                process,
+                request.socket_type,
+                request.flags,
+                readiness_sink,
+            )?;
+            Ok(UnixSocketResponse::CreatePair(
+                CreateUnixSocketPairResponse { first, second },
+            ))
+        }
+        UnixSocketRequest::Bind(request) => {
+            let address = match read_unix_socket_address(shared_buffers, request.address)? {
+                Ok(address) => address,
+                Err(error) => return Ok(UnixSocketResponse::Failed(error)),
+            };
+            Ok(unix_socket::bind(
+                process,
+                request.handle,
+                &address,
+                request.user,
+                request.mode,
+            )?
+            .map_or_else(UnixSocketResponse::Failed, |()| UnixSocketResponse::Bind))
+        }
+        UnixSocketRequest::Listen(request) => {
+            Ok(
+                unix_socket::listen(process, request.handle, request.backlog)?
+                    .map_or_else(UnixSocketResponse::Failed, |()| UnixSocketResponse::Listen),
+            )
+        }
+        UnixSocketRequest::Connect(request) => {
+            let address = match read_unix_socket_address(shared_buffers, request.address)? {
+                Ok(address) => address,
+                Err(error) => return Ok(UnixSocketResponse::Failed(error)),
+            };
+            Ok(
+                unix_socket::connect(process, request.handle, &address, request.user)?
+                    .map_or_else(UnixSocketResponse::Failed, |()| UnixSocketResponse::Connect),
+            )
+        }
+        UnixSocketRequest::Accept(request) => {
+            Ok(
+                unix_socket::accept(process, request.handle, request.flags, readiness_sink)?
+                    .map_or_else(UnixSocketResponse::Failed, |handle| {
+                        UnixSocketResponse::Accept(AcceptUnixSocketResponse { handle })
+                    }),
+            )
+        }
+        UnixSocketRequest::Send(request) => {
+            let buffer = read_shared_buffer(
+                shared_buffers,
+                request.buffer,
+                MAX_UNIX_SOCKET_TRANSFER_SIZE,
+            )?;
+            let (address, data) = buffer
+                .split_at_checked(request.address_length as usize)
+                .ok_or(RequestFailure::Abort(ErrorCode::MalformedRequest))?;
+            let address = if address.is_empty() {
+                None
+            } else {
+                match UnixSocketAddress::decode(address) {
+                    Ok(address) => Some(address),
+                    Err(_) => {
+                        return Ok(UnixSocketResponse::Failed(UnixSocketError::InvalidArgument));
+                    }
+                }
+            };
+            Ok(unix_socket::send(
+                process,
+                request.handle,
+                address.as_ref(),
+                data,
+                request.user,
+            )?
+            .map_or_else(UnixSocketResponse::Failed, |sent| {
+                UnixSocketResponse::Send(SendUnixSocketResponse {
+                    sent: u32::try_from(sent).expect("sent bytes fit in the request"),
+                })
+            }))
+        }
+        UnixSocketRequest::Receive(request) => {
+            validate_shared_buffer(request.buffer, MAX_UNIX_SOCKET_TRANSFER_SIZE)?;
+            let name_size = if request.source {
+                MAX_ENCODED_UNIX_SOCKET_NAME_SIZE
+            } else {
+                0
+            };
+            if request
+                .capacity
+                .checked_add(name_size)
+                .is_none_or(|length| length > request.buffer.length())
+            {
+                return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
+            }
+            let received = match unix_socket::receive(
+                process,
+                request.handle,
+                request.capacity,
+                request.peek,
+                request.source,
+                request.nonblocking,
+            )? {
+                Ok(received) => received,
+                Err(error) => return Ok(UnixSocketResponse::Failed(error)),
+            };
+            let length = u32::try_from(received.length)
+                .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
+            let data = received.data;
+            write_shared_buffer(
+                shared_buffers,
+                request.buffer,
+                &data,
+                MAX_UNIX_SOCKET_TRANSFER_SIZE,
+            )?;
+            let source_length = match received.source {
+                Some(source) => {
+                    let source = source
+                        .encode()
+                        .ok_or(RequestFailure::Abort(ErrorCode::Internal))?;
+                    shared_buffers
+                        .write_sequence(request.buffer, data.len(), &source)
+                        .map_err(shared_buffer_access_failure)?;
+                    source.len()
+                }
+                None => 0,
+            };
+            Ok(UnixSocketResponse::Receive(ReceiveUnixSocketResponse {
+                received: u32::try_from(data.len()).expect("received bytes fit the capacity"),
+                length,
+                source_length: u32::try_from(source_length).expect("encoded names fit in u32"),
+            }))
+        }
+        UnixSocketRequest::Shutdown(request) => {
+            Ok(
+                unix_socket::shutdown(process, request.handle, request.mode)?
+                    .map_or_else(UnixSocketResponse::Failed, |()| {
+                        UnixSocketResponse::Shutdown
+                    }),
+            )
+        }
+        UnixSocketRequest::GetName(request) => {
+            validate_shared_buffer(request.buffer, MAX_ENCODED_UNIX_SOCKET_NAME_SIZE)?;
+            let name = match unix_socket::name(process, request.handle, request.peer)? {
+                Ok(name) => name,
+                Err(error) => return Ok(UnixSocketResponse::Failed(error)),
+            };
+            let encoded = name
+                .encode()
+                .ok_or(RequestFailure::Abort(ErrorCode::Internal))?;
+            if encoded.len() > request.buffer.length() as usize {
+                return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
+            }
+            write_shared_buffer(
+                shared_buffers,
+                request.buffer,
+                &encoded,
+                MAX_ENCODED_UNIX_SOCKET_NAME_SIZE,
+            )?;
+            Ok(UnixSocketResponse::GetName(GetUnixSocketNameResponse {
+                length: u32::try_from(encoded.len()).expect("encoded names fit in u32"),
+            }))
+        }
+        UnixSocketRequest::SetOption(request) => {
+            unix_socket::set_option(process, request.handle, request.value)?;
+            Ok(UnixSocketResponse::SetOption)
+        }
+        UnixSocketRequest::GetOption(request) => {
+            let value = unix_socket::get_option(process, request.handle, request.name)?;
+            Ok(UnixSocketResponse::GetOption(GetUnixSocketOptionResponse {
+                value,
+            }))
+        }
+    }
+}
+
+/// Reads an encoded Unix socket address, reporting an undecodable one as
+/// an invalid argument.
+fn read_unix_socket_address<Memory: SharedMemory>(
+    shared_buffers: &SharedBufferPool<Memory>,
+    buffer: SharedBufferSequence,
+) -> RequestResult<UnixSocketResult<UnixSocketAddress>> {
+    let encoded = read_shared_buffer(shared_buffers, buffer, MAX_ENCODED_UNIX_SOCKET_ADDRESS_SIZE)?;
+    Ok(UnixSocketAddress::decode(&encoded).map_err(|_| UnixSocketError::InvalidArgument))
+}
+
 fn handle_event_request(
     process: &BrokerProcess,
     request: EventRequest,
@@ -1511,6 +1724,10 @@ mod tests {
     };
     use litebox_broker_protocol::timer::{
         GetTimerRequest, ReadTimerRequest, SetTimerRequest, TimerSpec,
+    };
+    use litebox_broker_protocol::unix_socket::{
+        ConnectUnixSocketRequest, CreateUnixSocketRequest, ReceiveUnixSocketRequest,
+        SendUnixSocketRequest, UnixSocketName,
     };
     use litebox_broker_protocol::{ObjectHandle, ProcessId, ProtocolVersion, RequestId, ThreadId};
     use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemoryError};
@@ -1850,6 +2067,7 @@ mod tests {
         active_requests_operate_timers(&broker, &timer_provider);
         association_shared_buffer_sequences_stage_pipe_data(&broker);
         association_shared_buffer_sequences_stage_socket_data(&broker);
+        association_shared_buffer_sequences_stage_unix_socket_data(&broker);
         association_shared_buffer_sequence_stages_random_data(&broker);
         active_request_queries_file_terminal(&broker, &stdio_provider);
         active_requests_change_file_status_flags(&broker);
@@ -2686,6 +2904,129 @@ mod tests {
             .read(SharedBufferSlotIndex(1), &mut second_slot)
             .unwrap();
         assert_eq!(second_slot, [9]);
+    }
+
+    fn association_shared_buffer_sequences_stage_unix_socket_data(broker: &BrokerCore) {
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        let shared_buffers = test_shared_buffers();
+        let request = |operation| {
+            let BrokerResult::UnixSocket(response) =
+                handle_test_request_with_buffers(&process, operation, &shared_buffers)
+            else {
+                panic!("expected a Unix socket response");
+            };
+            response
+        };
+        let stage = |slot, data: &[u8]| {
+            shared_buffers
+                .write(SharedBufferSlotIndex(slot), data)
+                .unwrap();
+            single_slot_sequence(slot, u32::try_from(data.len()).unwrap())
+        };
+        let receive = |handle, capacity: u32| {
+            let response = request(BrokerOperation::UnixSocket(UnixSocketRequest::Receive(
+                ReceiveUnixSocketRequest {
+                    handle,
+                    buffer: single_slot_sequence(9, capacity + MAX_ENCODED_UNIX_SOCKET_NAME_SIZE),
+                    capacity,
+                    peek: false,
+                    source: true,
+                    nonblocking: false,
+                },
+            )));
+            let UnixSocketResponse::Receive(response) = response else {
+                panic!("expected a receive response, got {response:?}");
+            };
+            let mut output = std::vec![0; (response.received + response.source_length) as usize];
+            shared_buffers
+                .read(SharedBufferSlotIndex(9), &mut output)
+                .unwrap();
+            let source = output.split_off(response.received as usize);
+            (
+                output,
+                response.length,
+                UnixSocketName::decode(&source).unwrap(),
+            )
+        };
+
+        // A stream pair moves staged bytes to its peer.
+        let UnixSocketResponse::CreatePair(pair) = request(BrokerOperation::UnixSocket(
+            UnixSocketRequest::CreatePair(CreateUnixSocketRequest {
+                socket_type: SocketType::Stream,
+                flags: FileOpenFlags::NONE,
+            }),
+        )) else {
+            panic!("expected Unix socket pair creation");
+        };
+        assert_eq!(
+            request(BrokerOperation::UnixSocket(UnixSocketRequest::Send(
+                SendUnixSocketRequest {
+                    handle: pair.first,
+                    buffer: stage(2, &[1, 2, 3]),
+                    address_length: 0,
+                    user: ROOT,
+                },
+            ))),
+            UnixSocketResponse::Send(SendUnixSocketResponse { sent: 3 })
+        );
+        assert_eq!(
+            receive(pair.second, 8),
+            (std::vec![1, 2, 3], 3, UnixSocketName::Unnamed)
+        );
+
+        // An undecodable address fails the operation without aborting.
+        assert_eq!(
+            request(BrokerOperation::UnixSocket(UnixSocketRequest::Connect(
+                ConnectUnixSocketRequest {
+                    handle: pair.first,
+                    address: stage(3, &[0xff]),
+                    user: ROOT,
+                },
+            ))),
+            UnixSocketResponse::Failed(UnixSocketError::InvalidArgument)
+        );
+
+        // A receive that does not ask for the source name needs room only
+        // for the data, and one that does but lacks room for it is malformed.
+        let receive_into_data_buffer = |source| {
+            complete_request(handle_request(
+                &process,
+                BrokerOperation::UnixSocket(UnixSocketRequest::Receive(ReceiveUnixSocketRequest {
+                    handle: pair.second,
+                    buffer: single_slot_sequence(9, 8),
+                    capacity: 8,
+                    peek: false,
+                    source,
+                    nonblocking: false,
+                })),
+                &shared_buffers,
+                &test_readiness_sink(),
+            ))
+        };
+        request(BrokerOperation::UnixSocket(UnixSocketRequest::Send(
+            SendUnixSocketRequest {
+                handle: pair.first,
+                buffer: stage(2, &[4, 5]),
+                address_length: 0,
+                user: ROOT,
+            },
+        )));
+        assert_eq!(
+            receive_into_data_buffer(true),
+            Err(ErrorCode::MalformedRequest)
+        );
+        assert_eq!(
+            receive_into_data_buffer(false),
+            Ok(BrokerResult::UnixSocket(UnixSocketResponse::Receive(
+                ReceiveUnixSocketResponse {
+                    received: 2,
+                    length: 2,
+                    source_length: 0,
+                }
+            )))
+        );
     }
 
     fn association_shared_buffer_sequences_stage_socket_data(broker: &BrokerCore) {
