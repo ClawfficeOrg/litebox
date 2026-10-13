@@ -35,10 +35,10 @@ extern crate alloc;
 mod page_mgmt;
 mod x86_64;
 use x86_64::{
-    GUEST_XSTATE, GuestXstateInit, activate_xstate, copy_signal_context, exception_callback,
-    interrupt_callback, interrupt_callback_no_xsave, run_thread_arch, saved_tls,
-    set_saved_host_tls_base, set_signal_return, signal_handler_exit_guest, switch_to_guest,
-    switch_to_guest_end, switch_to_guest_start, syscall_callback, tls,
+    GuestXstateInit, activate_xstate, copy_signal_context, exception_callback, interrupt_callback,
+    interrupt_callback_no_xsave, run_thread_arch, saved_tls, set_saved_host_tls_base,
+    set_signal_return, signal_handler_exit_guest, switch_to_guest, switch_to_guest_end,
+    switch_to_guest_start, syscall_callback, tls,
 };
 
 /// The userland Linux platform.
@@ -680,12 +680,9 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
         >,
     ) -> Result<(), Self::ThreadSpawnError> {
         let ctx = ctx.clone();
-        // Inherits the calling guest's saved extended CPU state.
-        let xstate_init = GUEST_XSTATE.with_borrow(|guest| {
-            guest.as_ref().map_or(GuestXstateInit::Initial, |guest| {
-                GuestXstateInit::Inherited(guest.clone())
-            })
-        });
+        let xstate_init = GuestXstateInit::Inherited(
+            litebox::platform::GuestVectorStateProvider::get_guest_vector_state(self),
+        );
         // TODO: do we need to wait for the handle in the main thread?
         let _handle = spawn_guest_thread(move || thread_start(init_thread, ctx, xstate_init))?;
 

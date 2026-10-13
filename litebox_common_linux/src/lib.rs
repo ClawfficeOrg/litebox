@@ -23,6 +23,10 @@ pub mod loader;
 pub mod mm;
 pub mod physical_pointers;
 pub mod signal;
+#[cfg(target_arch = "x86_64")]
+pub type GuestVectorState = litebox_common::arch::x86_64::xstate::XsaveArea;
+#[cfg(not(target_arch = "x86_64"))]
+pub type GuestVectorState = ();
 pub mod user_pointers;
 pub mod vmap;
 pub mod vmem;

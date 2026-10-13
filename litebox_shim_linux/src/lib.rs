@@ -79,6 +79,9 @@ pub trait ShimPlatform:
     + litebox::platform::SystemInfoProvider
     + litebox::platform::StdioProvider
     + litebox::platform::ArchSpecificProvider
+    + litebox::platform::GuestVectorStateProvider<
+        GuestVectorState = litebox_common_linux::GuestVectorState,
+    >
     + litebox::platform::ThreadProvider<ExecutionContext = litebox_common_linux::PtRegs>
     + litebox::platform::TimerProvider<Signal = litebox_common_linux::signal::Signal>
     + litebox::platform::SignalProvider<Signal = litebox_common_linux::signal::Signal>
@@ -101,6 +104,9 @@ where
         + litebox::platform::SystemInfoProvider
         + litebox::platform::StdioProvider
         + litebox::platform::ArchSpecificProvider
+        + litebox::platform::GuestVectorStateProvider<
+            GuestVectorState = litebox_common_linux::GuestVectorState,
+        >
         + litebox::platform::ThreadProvider<ExecutionContext = litebox_common_linux::PtRegs>
         + litebox::platform::TimerProvider<Signal = litebox_common_linux::signal::Signal>
         + litebox::platform::SignalProvider<Signal = litebox_common_linux::signal::Signal>
