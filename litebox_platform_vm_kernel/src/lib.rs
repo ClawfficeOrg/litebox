@@ -81,6 +81,7 @@ mod per_cpu;
 pub mod providers;
 
 mod syscall_entry;
+pub mod worker;
 
 /// Inputs to the single-CPU kernel handoff. The runner owns device setup and
 /// must keep the clock and allocator alive until reset.
@@ -502,12 +503,16 @@ impl VmKernel {
         // addresses as the boot mappings.
         unsafe { base_pt.load() };
 
-        alloc::boxed::Box::leak(alloc::boxed::Box::new(Self {
+        let platform = alloc::boxed::Box::leak(alloc::boxed::Box::new(Self {
             page_table_manager: PageTableManager::new(base_pt),
             clock,
             ram_frame_ranges,
             ioremap_next: spin::Mutex::new(IOREMAP.start),
-        }))
+        }));
+        if cfg!(debug_assertions) {
+            worker::self_check(platform);
+        }
+        platform
     }
 
     /// Halts until an interrupt is handled, with interrupts enabled only for
@@ -517,6 +522,23 @@ impl VmKernel {
     pub fn halt_until_interrupt(&self) {
         x86_64::instructions::interrupts::enable_and_hlt();
         x86_64::instructions::interrupts::disable();
+    }
+
+    /// A kernel stack of `size` bytes (a multiple of the page size), with an
+    /// unmapped guard page below it; its top. Never freed.
+    fn allocate_worker_stack(&self, size: usize) -> usize {
+        use alloc::alloc::{Layout, alloc_zeroed, handle_alloc_error};
+        let layout = Layout::from_size_align(size + PAGE_SIZE, PAGE_SIZE)
+            .expect("a page-aligned stack size");
+        // Safety: nonzero size. Leaked: the guard stays unmapped.
+        let base = unsafe { alloc_zeroed(layout) };
+        if base.is_null() {
+            handle_alloc_error(layout);
+        }
+        // Safety: its first page, unused. Kernel mappings are shared by every
+        // page table.
+        unsafe { per_cpu::unmap_guard(&self.page_table_manager.base_page_table, base as usize) };
+        base as usize + PAGE_SIZE + size
     }
 
     /// Only valid for addresses in the kernel's direct mapping.
@@ -991,6 +1013,36 @@ where
     T: EnterShim<ExecutionContext = PtRegs>,
 {
     run_thread_inner(shim, ctx, true, state, false);
+}
+
+/// Runs `f` outside any thread's run, with `shim` handling kernel page faults
+/// as during one (e.g., demand paging its user memory), for the kernel to
+/// access a thread's memory between its runs. Its address space must be
+/// current.
+///
+/// # Panics
+///
+/// If called during a run, or nested.
+pub fn with_user_faults<R>(
+    shim: &dyn EnterShim<ExecutionContext = PtRegs>,
+    f: impl FnOnce() -> R,
+) -> R {
+    let thread_ctx = ThreadContext {
+        shim,
+        // Kernel-fault handlers do not touch it.
+        ctx: core::ptr::null_mut(),
+    };
+    with_per_cpu_variables(|pcv| {
+        assert!(
+            !pcv.asm.is_in_user() && pcv.fault_context.get().is_null(),
+            "user faults are already handled"
+        );
+        pcv.fault_context
+            .set(core::ptr::from_ref(&thread_ctx).cast());
+    });
+    let result = f();
+    with_per_cpu_variables(|pcv| pcv.fault_context.set(core::ptr::null()));
+    result
 }
 
 /// A user thread's state that the platform keeps across its runs, besides
@@ -1476,6 +1528,18 @@ unsafe extern "C" fn kernel_exception_handler_no_ctx(
     error_code: usize,
     faulting_rip: usize,
 ) -> usize {
+    let fault_context = with_per_cpu_variables(|pcv| pcv.fault_context.get());
+    if !fault_context.is_null() {
+        let regs = PtRegs {
+            orig_rax: error_code,
+            rip: faulting_rip,
+            ..PtRegs::default()
+        };
+        // Safety: `with_user_faults` keeps it alive while set.
+        return unsafe {
+            kernel_exception_handler(&*fault_context.cast::<ThreadContext>(), &regs, cr2)
+        };
+    }
     search_exception_tables(faulting_rip).unwrap_or_else(|| {
         panic!(
             "EXCEPTION: PAGE FAULT outside run_thread_arch (no ThreadContext)\n\
