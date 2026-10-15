@@ -102,7 +102,7 @@ impl<Platform: ShimPlatform> litebox_common_linux::loader::MapMemory for ElfFile
             .checked_add(align.max(PAGE_SIZE) - PAGE_SIZE)
             .and_then(|len| {
                 len.checked_add(if self.reserve_runtime_trampoline {
-                    litebox_common_linux::vmem::DEFAULT_RESERVED_SPACE_SIZE
+                    litebox_common_linux::loader::RUNTIME_TRAMPOLINE_RESERVATION_SIZE
                 } else {
                     0
                 })
@@ -264,12 +264,8 @@ impl<'a, Platform: ShimPlatform> FileAndParsed<'a, Platform> {
         // When the platform requires syscall rewriting but the binary has no
         // embedded trampoline, reserve space so that brk starts past the
         // runtime trampoline region.
-        let reserve = if syscall_entry_point != 0 && !self.parsed.has_trampoline() {
-            Some(litebox_common_linux::vmem::DEFAULT_RESERVED_SPACE_SIZE)
-        } else {
-            None
-        };
-        self.file.reserve_runtime_trampoline = reserve.is_some();
+        let reserve = syscall_entry_point != 0 && !self.parsed.has_trampoline();
+        self.file.reserve_runtime_trampoline = reserve;
         let result = self.parsed.load(&mut self.file, &mut &*platform, reserve)?;
         #[cfg(target_arch = "aarch64")]
         if self.parsed.has_trampoline() {
@@ -703,6 +699,49 @@ mod tests {
             "ET_EXEC interpreter loaded at {:#x}, near the low-heap region {:#x} rather than top-down high (>= {high:#x})",
             interp.base_addr,
             crate::loader::DEFAULT_LOW_ADDR,
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn runtime_trampoline_stays_below_main_brk() {
+        let task = crate::syscalls::tests::init_platform();
+        assert_ne!(
+            litebox::platform::SystemInfoProvider::get_syscall_entry_point(task.global.platform),
+            0
+        );
+        let mut elf = minimal_elf(ET_DYN, None);
+        elf[128..].fill(0x90);
+        for slot in elf[128..].as_chunks_mut::<16>().0 {
+            slot[..2].copy_from_slice(&[0x0f, 0x05]);
+        }
+        crate::syscalls::tests::create_file(&task, "/brk-main", &elf);
+
+        let mut loader = ElfLoader::new(&task, "/brk-main").expect("loader should parse test ELF");
+        let info = loader
+            .main
+            .load_mapped(task.global.platform)
+            .expect("main should load");
+        // The x86-64 runtime trampoline fills the loader's reservation exactly.
+        let reservation = litebox_common_linux::loader::runtime_trampoline_reservation(
+            info.base_addr + PAGE_SIZE,
+        )
+        .unwrap();
+        assert_eq!(
+            task.global.mm.get_memory_permissions(
+                NonZeroAddress::new(reservation.start).unwrap(),
+                NonZeroPageSize::new(reservation.len()).unwrap(),
+            ),
+            Some(
+                litebox::platform::page_mgmt::MemoryRegionPermissions::READ
+                    | litebox::platform::page_mgmt::MemoryRegionPermissions::EXEC
+            ),
+            "the runtime trampoline should be mapped at {reservation:#x?}",
+        );
+        assert!(
+            reservation.end <= info.brk,
+            "trampoline {reservation:#x?} caps the brk heap starting at {:#x}",
+            info.brk,
         );
     }
 }

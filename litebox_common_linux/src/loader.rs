@@ -103,6 +103,19 @@ pub const TRAMPOLINE_HEADER_SIZE: usize = if cfg!(target_pointer_width = "64") {
     size_of::<TrampolineHeader32>()
 };
 
+/// Address space left free past an unpatched ELF image for its runtime trampoline.
+pub const RUNTIME_TRAMPOLINE_RESERVATION_SIZE: usize = 0x100_0000; // 16 MiB
+
+/// Address range kept free past an unpatched ELF image for its runtime trampoline.
+///
+/// `load_end` is the relocated end of the image's highest `PT_LOAD`. The loader starts `brk`
+/// past this range and the runtime rewriter prefers its start for the trampoline, so the
+/// trampoline does not cap upward heap growth. Returns `None` on overflow.
+pub fn runtime_trampoline_reservation(load_end: usize) -> Option<core::ops::Range<usize>> {
+    let start = load_end.checked_next_multiple_of(HOST_PAGE_SIZE)?;
+    Some(start..start.checked_add(RUNTIME_TRAMPOLINE_RESERVATION_SIZE)?)
+}
+
 /// Location of the LiteBox trampoline code described by a validated trampoline header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TrampolineLayout {
@@ -476,7 +489,7 @@ impl ElfParsedFile {
         &self,
         mapper: &mut M,
         mem: &mut impl AccessMemory,
-        reserve_trampoline: Option<usize>,
+        reserve_runtime_trampoline: bool,
     ) -> Result<MappingInfo, ElfLoadError<M::Error>> {
         let base_addr = if self.header.e_type == elf::abi::ET_DYN {
             // Find an aligned load address that will fit all PT_LOAD segments.
@@ -599,16 +612,15 @@ impl ElfParsedFile {
 
         if self.trampoline.is_some() {
             self.load_trampoline(mapper, mem, &mut info)?;
-        } else if let Some(size) = reserve_trampoline {
+        } else if reserve_runtime_trampoline {
             // Reserve space for a runtime trampoline so brk starts past it.
             // The runtime patching path (do_mmap_file → maybe_patch_exec_segment)
-            // will allocate the actual trampoline in this region via MAP_FIXED.
+            // prefers the start of this region for the trampoline, falling back
+            // to a search within branch reach if it is unavailable.
             // Match the runtime rewriter's native-page-aligned placement.
-            info.brk = info
-                .brk
-                .checked_next_multiple_of(HOST_PAGE_SIZE)
-                .and_then(|start| page_align_up(size).and_then(|size| start.checked_add(size)))
-                .ok_or(ElfLoadError::InvalidProgramHeader)?;
+            info.brk = runtime_trampoline_reservation(info.brk)
+                .ok_or(ElfLoadError::InvalidProgramHeader)?
+                .end;
         }
 
         // The initial writable brk heap must not share native backing with an

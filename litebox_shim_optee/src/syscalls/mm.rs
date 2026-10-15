@@ -3,6 +3,7 @@
 
 //! Implementation of memory management related syscalls, eg., `mmap`, `munmap`, etc.
 
+use litebox_common_linux::mm::MmapPlacement;
 use litebox_common_linux::vmem::{MappingError, PAGE_SIZE};
 use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno, user_pointers::UserPtrMut};
 
@@ -31,9 +32,9 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
                 len,
                 prot,
                 flags,
-                litebox_common_linux::mm::MmapPlacement {
+                MmapPlacement {
                     direction: litebox::platform::page_mgmt::AllocationDirection::BottomUp,
-                    ensure_space_after: false,
+                    allowed_range: None,
                 },
                 op,
             )
