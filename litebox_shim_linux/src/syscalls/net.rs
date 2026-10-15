@@ -888,11 +888,9 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         fd: &SocketFd<Platform>,
         sockaddr: SocketAddr,
     ) -> Result<(), Errno> {
-        if sockaddr.port() == 0 || sockaddr.ip().is_unspecified() {
-            return Err(Errno::ECONNREFUSED);
-        }
         let send_timeout = self.with_socket_options(fd, |opt| opt.send_timeout);
         let mut check_progress = false;
+        let mut already_in_progress = false;
         cx.wait_on_events::<_, Errno>(
             self.get_status(fd).contains(OFlags::NONBLOCK),
             Events::IN | Events::OUT,
@@ -907,10 +905,17 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
                     check_progress = true;
                     Err(TryOpError::TryAgain)
                 }
+                // A blocking call waits for an earlier attempt just as for its own.
+                Err(litebox::net::errors::ConnectError::AlreadyInProgress) => {
+                    check_progress = true;
+                    already_in_progress = true;
+                    Err(TryOpError::TryAgain)
+                }
                 Err(e) => Err(TryOpError::Other(e.into())),
             },
         )
         .map_err(|err| match err {
+            TryOpError::TryAgain if already_in_progress => Errno::EALREADY,
             TryOpError::TryAgain => Errno::EINPROGRESS,
             err => wait_errno(send_timeout, err),
         })
@@ -968,7 +973,14 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
                     Ok(n) => Ok(n),
                     Err(ChannelWriteError::BufferFull) if is_empty_stream => Ok(0),
                     Err(ChannelWriteError::BufferFull) => Err(TryOpError::TryAgain),
-                    Err(e) => Err(TryOpError::Other(Errno::from(e))),
+                    // Like Linux, a pending socket error (such as a reset) is reported, and
+                    // consumed, in place of `EPIPE`.
+                    Err(e) => Err(TryOpError::Other(match Errno::from(e) {
+                        Errno::EPIPE => proxy
+                            .get_async_error(true)
+                            .map_or(Errno::EPIPE, Errno::from),
+                        errno => errno,
+                    })),
                 },
             )
             .map_err(|error| wait_errno(timeout, socket_io_errno(error)))
@@ -1173,8 +1185,14 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
                         proxy.set_async_error(error);
                         return Ok(received);
                     }
+                    // A pending error, such as the reset of an aborted connection attempt, is
+                    // reported first.
                     Err(ChannelReadError::NotConnected) => {
-                        return Err(TryOpError::Other(Errno::ENOTCONN));
+                        return Err(TryOpError::Other(
+                            proxy
+                                .get_async_error(true)
+                                .map_or(Errno::ENOTCONN, Errno::from),
+                        ));
                     }
                     Err(ChannelReadError::Socket(error)) => {
                         return Err(TryOpError::Other(error.into()));
@@ -1196,7 +1214,9 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
                         Some(error) => Err(error.into()),
                         None => Ok(0),
                     },
-                    Err(ChannelReadError::NotConnected) => Err(Errno::ENOTCONN),
+                    Err(ChannelReadError::NotConnected) => Err(proxy
+                        .get_async_error(true)
+                        .map_or(Errno::ENOTCONN, Errno::from)),
                     Err(ChannelReadError::Socket(error)) => Err(error.into()),
                     Err(ChannelReadError::WouldBlock) => {
                         Err(wait_errno(timeout, socket_io_errno(error)))

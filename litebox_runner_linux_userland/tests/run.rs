@@ -94,6 +94,7 @@ const BROKER_ONLY_C_TESTS: &[&str] = &[
     "pipe_broker.c",
     "tcp_broker.c",
     "tcp_broker_server.c",
+    "tcp_broker_states.c",
     "udp_broker.c",
     "udp_broker_namespace.c",
     "urandom_broker.c",
@@ -1870,6 +1871,127 @@ fn test_runner_broker_tcp_client_with_rewriter() {
     assert_eq!(broker.next_close_object_count(), 11);
     broker.join();
     server.join().unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_runner_broker_tcp_connection_states_with_rewriter() {
+    use std::io::{Read as _, Write as _};
+    use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
+    use std::os::fd::AsRawFd as _;
+    use std::time::Duration;
+
+    let target = common::compile(
+        "./tests/tcp_broker_states.c",
+        "broker_tcp_states_rewriter",
+        false,
+        false,
+    );
+
+    let reset_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let reset_port = reset_listener.local_addr().unwrap().port();
+    let reset_server = std::thread::spawn(move || {
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        for _ in 0..3 {
+            let (mut stream, _) = reset_listener.accept().unwrap();
+            stream.read_exact(&mut [0; 1]).unwrap();
+            // SAFETY: `stream` owns a live socket and `linger` is valid for the supplied length.
+            assert_eq!(
+                unsafe {
+                    libc::setsockopt(
+                        stream.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_LINGER,
+                        std::ptr::from_ref(&linger).cast(),
+                        libc::socklen_t::try_from(std::mem::size_of_val(&linger)).unwrap(),
+                    )
+                },
+                0
+            );
+        }
+    });
+
+    // Once its accept queue is full, this listener drops connection requests,
+    // so connects to it stay pending.
+    let unresponsive_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    // SAFETY: `unresponsive_listener` owns a live listening socket.
+    assert_eq!(
+        unsafe { libc::listen(unresponsive_listener.as_raw_fd(), 0) },
+        0
+    );
+    let unresponsive_address = unresponsive_listener.local_addr().unwrap();
+    let mut queued = Vec::new();
+    while let Ok(stream) =
+        TcpStream::connect_timeout(&unresponsive_address, Duration::from_millis(200))
+    {
+        queued.push(stream);
+        assert!(queued.len() < 8, "listener accept queue did not fill");
+    }
+
+    let half_closed_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let half_closed_port = half_closed_listener.local_addr().unwrap().port();
+    let half_closed_server = std::thread::spawn(move || {
+        (0..2)
+            .map(|_| {
+                let (stream, _) = half_closed_listener.accept().unwrap();
+                stream.shutdown(Shutdown::Write).unwrap();
+                stream
+            })
+            .collect::<Vec<_>>()
+    });
+
+    let greeting_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let greeting_port = greeting_listener.local_addr().unwrap().port();
+    let greeting_server = std::thread::spawn(move || {
+        let (mut stream, _) = greeting_listener.accept().unwrap();
+        stream.write_all(b"hi").unwrap();
+        stream
+    });
+
+    let open_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let open_port = open_listener.local_addr().unwrap().port();
+    let open_server = std::thread::spawn(move || {
+        (0..8)
+            .map(|_| open_listener.accept().unwrap().0)
+            .collect::<Vec<_>>()
+    });
+
+    // Freed after the other listeners are bound, so none of them can reuse it.
+    let refused_port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+
+    let mut runner = Runner::new(&target, "broker_tcp_states_rewriter");
+    let control_socket_path = unique_test_socket_path("runner-broker-tcp-states-control");
+    let broker = spawn_test_broker(
+        &control_socket_path,
+        litebox_broker_core::PolicyEngine::with_host_guaranteed_rights(
+            litebox_broker_core::ObjectRights::all(),
+        )
+        .with_socket_policy(gateway_tcp_policy()),
+        &[runner.tar_dir()],
+        1,
+    );
+    runner
+        .arg(reset_port.to_string())
+        .arg(unresponsive_address.port().to_string())
+        .arg(refused_port.to_string())
+        .arg(half_closed_port.to_string())
+        .arg(open_port.to_string())
+        .arg(greeting_port.to_string())
+        .broker_socket(&control_socket_path)
+        .run();
+    assert_eq!(broker.next_close_object_count(), 25);
+    broker.join();
+    reset_server.join().unwrap();
+    half_closed_server.join().unwrap();
+    open_server.join().unwrap();
+    greeting_server.join().unwrap();
 }
 
 #[cfg(target_os = "linux")]
