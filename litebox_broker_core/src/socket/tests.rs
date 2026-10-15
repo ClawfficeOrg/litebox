@@ -4,6 +4,7 @@
 use super::*;
 use crate::readiness::tests::TestReadinessSink;
 use crate::{BrokerCore, CallerCredential};
+use core::sync::atomic::{AtomicUsize, Ordering};
 use litebox_broker_protocol::socket::{AddressFamily, IpProtocol, SocketType};
 use std::net::Ipv4Addr;
 use std::sync::{Mutex as StdMutex, mpsc};
@@ -578,6 +579,8 @@ struct TestSocketState {
     tcp_option_sets: StdMutex<std::vec::Vec<TcpOptionValue>>,
     failed_readiness: StdMutex<Option<ReadinessRegistration>>,
     live_readiness: StdMutex<Option<ReadinessRegistration>>,
+    /// Runs whenever a socket's readiness is read.
+    readiness_hook: StdMutex<Option<std::boxed::Box<dyn Fn() + Send>>>,
     queue_next_guest_connect: core::sync::atomic::AtomicBool,
     pending_accept: StdMutex<Option<PendingAcceptedConnection>>,
 }
@@ -1070,6 +1073,9 @@ impl PlatformSocket for TestPlatformSocket {
     }
 
     fn readiness(&self) -> ReadinessFlags {
+        if let Some(hook) = &*self.state.readiness_hook.lock().unwrap() {
+            hook();
+        }
         ReadinessFlags::READ | ReadinessFlags::WRITE
     }
 }
@@ -1340,6 +1346,7 @@ fn test_broker_with_policy(
         pending_references: Arc::new(AtomicUsize::new(0)),
         reserved_pipe_capacity: Arc::new(AtomicUsize::new(0)),
         reserved_sockets: Arc::new(AtomicUsize::new(0)),
+        readiness_queue_entries: Arc::new(AtomicUsize::new(0)),
         reserved_child_image_size: Arc::new(core::sync::atomic::AtomicU64::new(0)),
         random_provider: Arc::new(crate::random::TestRandomProvider),
         socket_provider,
@@ -1504,6 +1511,139 @@ fn failed_accept_rolls_back_readiness_and_quota() {
     }
 
     process.close_object_reference(listener).unwrap();
+}
+
+#[test]
+fn socket_readiness_reaches_readiness_queues() {
+    use litebox_broker_protocol::readiness_queue::{
+        ReadinessQueueEntryFlags, ReadinessQueueInterest, ReadyEvent,
+    };
+
+    let provider = Arc::new(TestSocketProvider::default());
+    let broker = test_broker(Arc::clone(&provider) as Arc<dyn SocketProvider>);
+    let process = broker
+        .allocate_process(CallerCredential::Unauthenticated, None)
+        .unwrap();
+    let socket_sink = Arc::new(TestReadinessSink::default());
+    let socket = create(&process, create_request(), socket_sink.clone()).unwrap();
+    let queue_sink = Arc::new(TestReadinessSink::default());
+    let queue =
+        crate::readiness_queue::create(&process, &(queue_sink.clone() as Arc<dyn ReadinessSink>))
+            .unwrap();
+    let interest = ReadinessQueueInterest {
+        readiness: ReadinessFlags::READ,
+        flags: ReadinessQueueEntryFlags::EDGE_TRIGGERED,
+        token: 9,
+    };
+    let event = ReadyEvent {
+        token: 9,
+        readiness: ReadinessFlags::READ,
+    };
+    crate::readiness_queue::add(&process, queue, socket, 0, interest)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        crate::readiness_queue::take_ready(&process, queue, 4),
+        Ok(vec![event])
+    );
+    assert_eq!(
+        crate::readiness_queue::take_ready(&process, queue, 4),
+        Ok(vec![])
+    );
+
+    // The provider's publication reaches both the socket's reference and the
+    // queue.
+    queue_sink.republished.lock().unwrap().clear();
+    provider
+        .state
+        .live_readiness
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .publish(ReadinessFlags::READ)
+        .unwrap();
+    assert_eq!(
+        *socket_sink.published.lock().unwrap(),
+        [(socket, ReadinessFlags::READ)]
+    );
+    assert_eq!(
+        *queue_sink.republished.lock().unwrap(),
+        [(queue, ReadinessFlags::READ)]
+    );
+    assert_eq!(
+        crate::readiness_queue::take_ready(&process, queue, 4),
+        Ok(vec![event])
+    );
+
+    process.close_object_reference(queue).unwrap();
+    process.close_object_reference(socket).unwrap();
+}
+
+#[test]
+fn takes_wake_callers_that_found_the_queue_empty_meanwhile() {
+    use litebox_broker_protocol::readiness_queue::{
+        ReadinessQueueEntryFlags, ReadinessQueueInterest, ReadyEvent,
+    };
+
+    let provider = Arc::new(TestSocketProvider::default());
+    let broker = test_broker(Arc::clone(&provider) as Arc<dyn SocketProvider>);
+    let process = broker
+        .allocate_process(CallerCredential::Unauthenticated, None)
+        .unwrap();
+    let socket = create(
+        &process,
+        create_request(),
+        Arc::new(TestReadinessSink::default()),
+    )
+    .unwrap();
+    let queue_sink = Arc::new(TestReadinessSink::default());
+    let queue =
+        crate::readiness_queue::create(&process, &(queue_sink.clone() as Arc<dyn ReadinessSink>))
+            .unwrap();
+    let interest = ReadinessQueueInterest {
+        readiness: ReadinessFlags::READ,
+        flags: ReadinessQueueEntryFlags::empty(),
+        token: 9,
+    };
+    let event = ReadyEvent {
+        token: 9,
+        readiness: ReadinessFlags::READ,
+    };
+    crate::readiness_queue::add(&process, queue, socket, 0, interest)
+        .unwrap()
+        .unwrap();
+    queue_sink.republished.lock().unwrap().clear();
+
+    // Another caller finds the queue empty while a take holds its entry, so
+    // the take wakes it after queueing the level-triggered entry again.
+    let observer = Arc::clone(&process);
+    *provider.state.readiness_hook.lock().unwrap() = Some(std::boxed::Box::new(move || {
+        assert_eq!(
+            observer.check_readiness(queue),
+            Ok(ReadinessFlags::default())
+        );
+    }));
+    assert_eq!(
+        crate::readiness_queue::take_ready(&process, queue, 4),
+        Ok(vec![event])
+    );
+    provider.state.readiness_hook.lock().unwrap().take();
+    assert_eq!(
+        *queue_sink.republished.lock().unwrap(),
+        [(queue, ReadinessFlags::READ)]
+    );
+
+    // Otherwise, queueing the entry again wakes no one.
+    queue_sink.republished.lock().unwrap().clear();
+    assert_eq!(
+        crate::readiness_queue::take_ready(&process, queue, 4),
+        Ok(vec![event])
+    );
+    assert_eq!(*queue_sink.republished.lock().unwrap(), []);
+
+    process.close_object_reference(queue).unwrap();
+    process.close_object_reference(socket).unwrap();
 }
 
 #[test]
