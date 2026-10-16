@@ -11,8 +11,8 @@
 //!   deadlines.
 //! - [`ProcessTimer`]: the same timer, while a process runs, for its
 //!   `SetTimer` deadline and time slice.
-//! - [`Devices::shares`]: the VM's virtio-9p devices, each a host directory
-//!   mounted at its tag.
+//! - [`Devices::shares`]: the VM's virtio-9p devices, as host directories
+//!   mounted as their tags say.
 //!
 //! Also the wall clock ([`wall_clock`]), for runners.
 //!
@@ -29,7 +29,7 @@ use core::time::Duration;
 use litebox_broker_core::stdio::StdioOutputStream;
 use litebox_broker_smoltcp::Network;
 use litebox_broker_vm_kernel::Events;
-use litebox_broker_vm_kernel::share::{Share, Transport, TransportError};
+use litebox_broker_vm_kernel::share::{Share, ShareMode, Transport, TransportError};
 use litebox_broker_vm_kernel::stdio::Console;
 use litebox_hal::clock::Clock;
 use litebox_hal::devices::{ConsoleDevice, NetworkDevice, NinePDevice};
@@ -135,9 +135,8 @@ impl Devices {
             .lock()
     }
 
-    /// The VM's virtio-9p devices, brought up, as shares mounted at their
-    /// tags (see [`mount_path`]). Devices that cannot be driven, or whose tag
-    /// is not such a path or repeats another's, are skipped. Call once.
+    /// Skips devices that cannot be driven, with invalid tags
+    /// ([`mount_spec`]), or with a path already taken. Call once.
     pub fn shares(&'static self) -> Vec<Share> {
         let mut shares: Vec<Share> = Vec::new();
         for probed in NinePDevice::probe_all(self.platform, self.apic.target(DEVICE_VECTOR)) {
@@ -148,7 +147,7 @@ impl Devices {
                     continue;
                 }
             };
-            let Some(path) = device.mount_tag().and_then(mount_path) else {
+            let Some((path, mode)) = device.mount_tag().and_then(mount_spec) else {
                 litebox_util_log::warn!(
                     device:% = device,
                     tag:? = device.mount_tag().map(String::from_utf8_lossy);
@@ -164,9 +163,10 @@ impl Devices {
                 );
                 continue;
             }
-            litebox_util_log::info!(device:% = device, path:% = path; "share");
+            litebox_util_log::info!(device:% = device, path:% = path, mode:? = mode; "share");
             shares.push(Share {
                 path,
+                mode,
                 transport: Box::new(ShareTransport {
                     devices: self,
                     device,
@@ -370,15 +370,22 @@ impl Transport for ShareTransport {
     }
 }
 
-/// A mount tag as the path to mount its share at, if the broker can: its
-/// `Composer` panics on paths that are not absolute and normalized, and `/`
-/// and `/dev` (with what is under it) are reserved. Tags come from the host.
-fn mount_path(tag: &[u8]) -> Option<String> {
-    let path = core::str::from_utf8(tag).ok()?;
+/// `PATH[:MODE]`, as `docker run -v`'s: `ro`, `rw`, or `O` (the default,
+/// podman's overlay). The broker's `Composer` panics on relative or
+/// unnormalized paths; `/` and `/dev` are taken. Tags come from the host.
+fn mount_spec(tag: &[u8]) -> Option<(String, ShareMode)> {
+    let tag = core::str::from_utf8(tag).ok()?;
+    let (path, mode) = match tag.rsplit_once(':') {
+        None => (tag, ShareMode::Overlay),
+        Some((path, "ro")) => (path, ShareMode::ReadOnly),
+        Some((path, "rw")) => (path, ShareMode::ReadWrite),
+        Some((path, "O")) => (path, ShareMode::Overlay),
+        Some(_) => return None,
+    };
     let mut components = path.strip_prefix('/')?.split('/');
     let valid = components
         .clone()
         .all(|component| !matches!(component, "" | "." | ".."))
         && components.next() != Some("dev");
-    valid.then(|| String::from(path))
+    valid.then(|| (String::from(path), mode))
 }

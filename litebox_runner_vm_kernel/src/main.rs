@@ -13,8 +13,7 @@
 //! QEMU exits with 33 if all tests pass, 65 otherwise. Runner processes'
 //! standard streams are the VM's console device, if there is one, and their
 //! sockets reach the VM's network device, if there is one; programs also see
-//! the host directories of virtio-9p devices, read-only, at their mount tags
-//! ([`devices`]).
+//! the host directories of virtio-9p devices ([`devices`]).
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]

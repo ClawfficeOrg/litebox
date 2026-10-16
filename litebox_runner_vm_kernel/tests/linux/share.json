@@ -1,10 +1,10 @@
 [
   {
     "argv": ["/share"],
-    "expect_stdout": "hello from the host\nread-only\n"
+    "expect_stdout": "hello from the host\nhello from the host\nand from the guest\nnew\nwritable in memory\nhello from the host\nread-only\nhello from the host\nand from the guest\nnew\nread-write\nhello from the host\nhello from the host\nand from the guest\ncomposed\n"
   },
   {
-    "argv": ["/share-dyn"],
-    "expect_stdout": "hello from the host\nread-only\n"
+    "argv": ["/share-dyn", "again"],
+    "expect_stdout": "new\nhello from the host\nand from the guest\nagain\n"
   }
 ]

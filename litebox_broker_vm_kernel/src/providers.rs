@@ -3,16 +3,24 @@
 
 //! The broker core's providers: hardware randomness, timers, `/dev` (standard
 //! streams from the runner's [`StdioProvider`], `null`, `urandom`),
-//! optionally, a read-only root from a tar, read-only host directories
-//! ([`Share`]s) over 9P, and sockets.
+//! the root, host directories ([`Share`]s) over 9P, and sockets.
 
-use crate::share::{Share, ShareFs};
+use crate::share::{self, Share};
+use alloc::borrow::ToOwned;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use litebox_broker_core::{
     BrokerCore, BrokerCoreLimits, CallerCredential, DestinationPortRange, DestinationRule,
     Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy,
-    fs::{FileService, composer::Composer, devices::Devices, resolver::Resolver, tar_ro::TarRo},
+    fs::{
+        FileService, Mode, UserInfo,
+        composer::Composer,
+        devices::Devices,
+        in_mem::{InMem, InitialNode},
+        overlay::Overlay,
+        resolver::Resolver,
+        tar_ro::{EMPTY_TAR_FILE, TarRo},
+    },
     random::{RandomProvider, RandomProviderError},
     socket::SocketProvider,
     stdio::StdioProvider,
@@ -39,17 +47,28 @@ fn file_service(
     stdio: Arc<dyn StdioProvider>,
     random: Arc<dyn RandomProvider>,
 ) -> Arc<dyn FileService> {
-    let mut composer = Composer::builder();
-    if let Some(root) = root {
-        composer = composer.mount("/", |allocator| TarRo::new(root.into(), allocator));
-    }
-    composer = composer.mount("/dev", |allocator| Devices::new(allocator, stdio, random));
+    // TODO(broker core, as in userland): the resolver skips permission checks
+    // on backend roots (`/`, mount roots), and authorizes an open after the
+    // backend opens it, so a denied `O_TRUNC` still copies up an empty file.
+    let writable = InitialNode::Directory {
+        mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+        owner: UserInfo::ROOT,
+    };
+    let upper = InMem::<VmKernel>::new_initialized([("/tmp".to_owned(), writable)]);
+    let image = root.unwrap_or(EMPTY_TAR_FILE);
+    let mut composer = Composer::builder()
+        .mount_nestable("/", |allocators| {
+            Overlay::<VmKernel>::new(
+                upper,
+                TarRo::new(image.into(), allocators.next()),
+                allocators.next(),
+            )
+        })
+        .mount("/dev", |allocator| Devices::new(allocator, stdio, random));
     for share in shares {
-        composer = composer
-            .try_mount(&share.path, |allocator| {
-                ShareFs::new(share.transport, allocator)
-            })
-            .unwrap_or_else(|error| panic!("mounting a share at {}: {error}", share.path));
+        let path = share.path.clone();
+        composer = share::mount(composer, share)
+            .unwrap_or_else(|error| panic!("mounting a share at {path}: {error}"));
     }
     let devices = composer
         .build()
@@ -91,9 +110,8 @@ pub(crate) fn seed() -> u64 {
     u64::from_ne_bytes(seed)
 }
 
-/// Runner processes, which the kernel vouches for, may open and use files:
-/// the devices, `root`'s, if any, and the shares' (read-only); and sockets
-/// (see [`socket_policy`]).
+/// Runner processes, which the kernel vouches for, may open and use files and
+/// sockets (see [`socket_policy`]).
 ///
 /// # Panics
 ///

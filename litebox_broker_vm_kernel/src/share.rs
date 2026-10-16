@@ -1,27 +1,30 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Host directories over 9P2000.L ([`Share`]), like `litebox_broker_userland`'s
-//! `--mount HOST:GUEST`, but read-only for now. The runner's [`Transport`]s
-//! carry whole messages (e.g., a virtio-9p device), where the 9P client
-//! expects a byte stream.
+//! Host directories over 9P2000.L ([`Share`]), mounted as their [`ShareMode`]
+//! says. The runner's [`Transport`]s carry whole messages (e.g., a virtio-9p
+//! device), where the 9P client expects a byte stream.
 
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::fmt;
 use litebox_broker_core::fs::backend::{
     Backend, CreationMetadata, DirHandle, FileHandle, HandleRef, Permissioned, SeekBehavior,
     WalkOutcome, WalkingDirHandle,
 };
+use litebox_broker_core::fs::composer::ComposerBuilder;
 use litebox_broker_core::fs::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, ReadDirError,
     ReadError as FsReadError, RmdirError, TruncateError, UnlinkError, WalkError,
     WriteError as FsWriteError,
 };
+use litebox_broker_core::fs::in_mem::{InMem, InitialNode};
 use litebox_broker_core::fs::inode_allocator::InodeAllocator;
 use litebox_broker_core::fs::nine_p::transport::{Read, ReadError, Write, WriteError};
 use litebox_broker_core::fs::nine_p::{self, NineP};
+use litebox_broker_core::fs::overlay::Overlay;
 use litebox_broker_core::fs::{DirEntry, FileStatus, Mode, OFlags};
 use litebox_broker_core::readiness::ReadinessSource;
 use litebox_platform_vm_kernel::VmKernel;
@@ -48,14 +51,23 @@ pub trait Transport: Send {
 #[derive(Clone, Copy, Debug)]
 pub struct TransportError;
 
-/// A host directory mounted, read-only, at `path`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShareMode {
+    ReadOnly,
+    /// Writes reach the host directory, which must be one the guest may wipe
+    /// out; the 9P server decides what is allowed.
+    ReadWrite,
+    /// The host directory, read-only, under an in-memory layer: writes never
+    /// reach the host and are lost at shutdown.
+    Overlay,
+}
+
 pub struct Share {
-    /// Must be absolute and normalized, and unlike any other mount's path
-    /// (e.g., `/dev`, or `/` with a root tar), or building the broker's files
-    /// panics. Should also be neither `/` nor in `/dev`, which the broker
-    /// does not check: such a share would be the root, or sit among the
-    /// devices.
+    /// Absolute, normalized, and unlike other mounts' paths (e.g., `/`,
+    /// `/dev`), or building the broker's files panics. Not checked: must not
+    /// be in `/dev`.
     pub path: String,
+    pub mode: ShareMode,
     pub transport: Box<dyn Transport>,
 }
 
@@ -129,12 +141,12 @@ impl Read for Stream {
     }
 }
 
-/// A [`Share`]'s directory, as `litebox_broker_userland`'s `LocalFs` is a
-/// host directory, but read-only, as `TarRo` is: what would change it fails
-/// before it reaches the 9P backend, which, e.g., does not support opening a
-/// directory for writing. The rest goes to the 9P backend, with its own
-/// handles.
-pub(crate) struct ShareFs(NineP<VmKernel, Stream>);
+/// A [`Share`]'s directory. Unless [`ShareMode::ReadWrite`], writes fail
+/// before reaching the 9P backend.
+pub(crate) struct ShareFs {
+    fs: NineP<VmKernel, Stream>,
+    mode: ShareMode,
+}
 
 /// Linux's defaults for the user and tree a 9P mount attaches as; servers
 /// such as QEMU's ignore them.
@@ -147,14 +159,77 @@ impl ShareFs {
     /// # Errors
     ///
     /// Version negotiation or the attach failed.
-    pub(crate) fn new(
+    fn new(
         transport: Box<dyn Transport>,
+        mode: ShareMode,
         allocator: InodeAllocator,
     ) -> Result<Self, nine_p::Error> {
         let stream = Stream::new(transport);
         let msize = u32::try_from(stream.max_message_size()).unwrap_or(u32::MAX);
-        NineP::new(stream, msize, USER, TREE, allocator).map(Self)
+        let fs = NineP::new(stream, msize, USER, TREE, allocator)?;
+        Ok(Self { fs, mode })
     }
+
+    fn writable<E>(&self, error: E) -> Result<(), E> {
+        if self.mode == ShareMode::ReadWrite {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum MountError {
+    Attach(nine_p::Error),
+    Root,
+}
+
+impl fmt::Display for MountError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Attach(error) => write!(f, "attaching: {error}"),
+            Self::Root => f.write_str("looking at its root"),
+        }
+    }
+}
+
+/// An overlay reports its upper layer's root, so that copies the share
+/// root's mode and owner. They are reported, not enforced: the resolver does
+/// not check permissions on mount roots.
+///
+/// TODO: the 9P backend fails on host uids/gids beyond 16 bits.
+pub(crate) fn mount(
+    composer: ComposerBuilder,
+    share: Share,
+) -> Result<ComposerBuilder, MountError> {
+    let Share {
+        path,
+        mode,
+        transport,
+    } = share;
+    if mode != ShareMode::Overlay {
+        return composer.try_mount(&path, |allocator| {
+            ShareFs::new(transport, mode, allocator).map_err(MountError::Attach)
+        });
+    }
+    composer.try_mount_nestable(&path, |allocators| {
+        let lower = ShareFs::new(transport, mode, allocators.next()).map_err(MountError::Attach)?;
+        let root = lower
+            .owned_dir_at(lower.root(), OFlags::PATH)
+            .map_err(|_| MountError::Root)?;
+        let root = lower
+            .status(HandleRef::Dir(&root))
+            .map_err(|_| MountError::Root)?;
+        let upper = InMem::<VmKernel>::new_initialized([(
+            "/",
+            InitialNode::Directory {
+                mode: root.mode,
+                owner: root.owner,
+            },
+        )]);
+        Ok(Overlay::<VmKernel>::new(upper, lower, allocators.next()))
+    })
 }
 
 const WRITE_FLAGS: OFlags = OFlags::CREAT
@@ -162,9 +237,13 @@ const WRITE_FLAGS: OFlags = OFlags::CREAT
     .union(OFlags::WRONLY)
     .union(OFlags::RDWR);
 
+// TODO: the 9P backend leaves permission checks to the server, and QEMU
+// checks only its own host user. Reporting modes and owners
+// (`PermissionCheck::ByResolver`) would let the resolver check the guest's
+// user, at a `Tgetattr` per walked component.
 impl Backend for ShareFs {
     fn root(&self) -> WalkingDirHandle<'_> {
-        self.0.root()
+        self.fs.root()
     }
 
     fn walk_directories<'a>(
@@ -172,22 +251,25 @@ impl Backend for ShareFs {
         from: WalkingDirHandle<'a>,
         components: &[&str],
     ) -> Result<WalkOutcome<WalkingDirHandle<'a>>, WalkError> {
-        self.0.walk_directories(from, components)
+        self.fs.walk_directories(from, components)
     }
 
+    /// The 9P backend panics on directories opened for writing, so they are
+    /// opened read-only, as `InMem` allows.
     fn owned_dir_at(
         &self,
         dir: WalkingDirHandle<'_>,
         flags: OFlags,
     ) -> Result<DirHandle, OpenError> {
         if flags.intersects(WRITE_FLAGS) {
-            return Err(OpenError::ReadOnlyFileSystem);
+            self.writable(OpenError::ReadOnlyFileSystem)?;
         }
-        self.0.owned_dir_at(dir, flags)
+        self.fs
+            .owned_dir_at(dir, flags - OFlags::WRONLY - OFlags::RDWR)
     }
 
     fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<WalkingDirHandle<'a>> {
-        self.0.walking_dir_at(dir)
+        self.fs.walking_dir_at(dir)
     }
 
     /// An exclusive creation of an existing file must succeed, read-only, for
@@ -198,90 +280,109 @@ impl Backend for ShareFs {
         name: &str,
         flags: OFlags,
     ) -> Result<Permissioned<FileHandle>, OpenError> {
+        if self.mode == ShareMode::ReadWrite {
+            return self.fs.open_file_at(dir, name, flags);
+        }
         let exclusive = flags.contains(OFlags::CREAT | OFlags::EXCL);
         if !exclusive && flags.intersects(WRITE_FLAGS) {
             return Err(OpenError::ReadOnlyFileSystem);
         }
-        self.0
+        self.fs
             .open_file_at(dir, name, flags - WRITE_FLAGS - OFlags::EXCL)
     }
 
+    /// The overlay lists its lower directories through `O_PATH` handles,
+    /// which the 9P backend cannot read, so they are reopened. The resolver
+    /// lists only opened directories, which must stay readable after removal,
+    /// so those are not. `lookup_at` defaults to this.
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
-        self.0.list_dir_at(handle)
-    }
-
-    fn lookup_at(&self, dir: &DirHandle, name: &str) -> Result<Option<DirEntry>, ReadDirError> {
-        self.0.lookup_at(dir, name)
+        if self.mode != ShareMode::Overlay {
+            return self.fs.list_dir_at(handle);
+        }
+        let walking = self.fs.walking_dir_at(&handle).ok_or(ReadDirError::Io)?;
+        let opened = self
+            .fs
+            .owned_dir_at(walking, OFlags::RDONLY)
+            .map_err(|_| ReadDirError::Io)?;
+        self.fs.list_dir_at(opened)
     }
 
     fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, FsReadError> {
-        self.0.read(h, buf, offset)
+        self.fs.read(h, buf, offset)
     }
 
     fn get_static_backing_data(&self, h: &FileHandle) -> Option<&'static [u8]> {
-        self.0.get_static_backing_data(h)
+        self.fs.get_static_backing_data(h)
     }
 
-    fn write(&self, _h: &FileHandle, _buf: &[u8], _offset: usize) -> Result<usize, FsWriteError> {
-        Err(FsWriteError::NotForWriting)
+    fn write(&self, h: &FileHandle, buf: &[u8], offset: usize) -> Result<usize, FsWriteError> {
+        self.writable(FsWriteError::NotForWriting)?;
+        self.fs.write(h, buf, offset)
     }
 
-    fn truncate(&self, _h: &FileHandle, _length: usize) -> Result<(), TruncateError> {
-        Err(TruncateError::NotForWriting)
+    fn truncate(&self, h: &FileHandle, length: usize) -> Result<(), TruncateError> {
+        self.writable(TruncateError::NotForWriting)?;
+        self.fs.truncate(h, length)
     }
 
     fn seek_behavior(&self, h: &FileHandle) -> SeekBehavior {
-        self.0.seek_behavior(h)
+        self.fs.seek_behavior(h)
     }
 
     fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
-        self.0.status(h)
+        self.fs.status(h)
     }
 
     fn is_terminal(&self, h: &FileHandle) -> bool {
-        self.0.is_terminal(h)
+        self.fs.is_terminal(h)
     }
 
     fn readiness_source(&self, h: &FileHandle) -> Option<Arc<dyn ReadinessSource>> {
-        self.0.readiness_source(h)
+        self.fs.readiness_source(h)
     }
 
     fn create_file_at(
         &self,
-        _dir: DirHandle,
-        _name: &str,
-        _metadata: CreationMetadata,
+        dir: DirHandle,
+        name: &str,
+        metadata: CreationMetadata,
     ) -> Result<FileHandle, OpenError> {
-        Err(OpenError::ReadOnlyFileSystem)
+        self.writable(OpenError::ReadOnlyFileSystem)?;
+        self.fs.create_file_at(dir, name, metadata)
     }
 
     fn mkdir_at(
         &self,
-        _dir: DirHandle,
-        _name: &str,
-        _metadata: CreationMetadata,
+        dir: DirHandle,
+        name: &str,
+        metadata: CreationMetadata,
     ) -> Result<DirHandle, MkdirError> {
-        Err(MkdirError::ReadOnlyFileSystem)
+        self.writable(MkdirError::ReadOnlyFileSystem)?;
+        self.fs.mkdir_at(dir, name, metadata)
     }
 
-    fn unlink_at(&self, _dir: DirHandle, _name: &str) -> Result<(), UnlinkError> {
-        Err(UnlinkError::ReadOnlyFileSystem)
+    fn unlink_at(&self, dir: DirHandle, name: &str) -> Result<(), UnlinkError> {
+        self.writable(UnlinkError::ReadOnlyFileSystem)?;
+        self.fs.unlink_at(dir, name)
     }
 
-    fn rmdir_at(&self, _dir: DirHandle, _name: &str) -> Result<(), RmdirError> {
-        Err(RmdirError::ReadOnlyFileSystem)
+    fn rmdir_at(&self, dir: DirHandle, name: &str) -> Result<(), RmdirError> {
+        self.writable(RmdirError::ReadOnlyFileSystem)?;
+        self.fs.rmdir_at(dir, name)
     }
 
-    fn chmod(&self, _h: HandleRef<'_>, _mode: Mode) -> Result<(), ChmodError> {
-        Err(ChmodError::ReadOnlyFileSystem)
+    fn chmod(&self, h: HandleRef<'_>, mode: Mode) -> Result<(), ChmodError> {
+        self.writable(ChmodError::ReadOnlyFileSystem)?;
+        self.fs.chmod(h, mode)
     }
 
     fn chown(
         &self,
-        _h: HandleRef<'_>,
-        _user: Option<u16>,
-        _group: Option<u16>,
+        h: HandleRef<'_>,
+        user: Option<u16>,
+        group: Option<u16>,
     ) -> Result<(), ChownError> {
-        Err(ChownError::ReadOnlyFileSystem)
+        self.writable(ChownError::ReadOnlyFileSystem)?;
+        self.fs.chown(h, user, group)
     }
 }

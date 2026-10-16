@@ -9,12 +9,13 @@
 # Every litebox_runner_vm_kernel/tests/linux/<name>.c is compiled three times,
 # as /<name> (static), /<name>-pie (static PIE), and /<name>-dyn (dynamically
 # linked), or, if in DYNAMIC_ONLY, only as /<name>-dyn, into rootfs.tar, the
-# broker's read-only root. As in litebox_runner_linux_userland's tests, the
-# root also has the dynamic programs' shared libraries and interpreter, as
-# ldd lists them, and libgcc_s.so.1, at their host paths; as the root has no
-# symbolic links, they are copies of what the links name. The shim patches
-# their syscalls as the programs map them. The root is packed with the
-# userland runner and a test's runs into a tar passed as the initrd.
+# broker's root image, with /data/image.txt. As in
+# litebox_runner_linux_userland's tests, the root also has the dynamic
+# programs' shared libraries and interpreter, as ldd lists them, and
+# libgcc_s.so.1, at their host paths; as the root has no symbolic links, they
+# are copies of what the links name. The shim patches their syscalls as the
+# programs map them. The root is packed with the userland runner and a test's
+# runs into a tar passed as the initrd.
 #
 # A test is litebox_runner_vm_kernel/tests/linux/<test>.json, the kernel's
 # programs.json (see litebox_runner_vm_kernel/src/client/program.rs), which
@@ -32,8 +33,14 @@
 # isolated from the host (restrict=on) but for an echo server (cat) at
 # 10.0.2.100:7. The guest is 10.0.2.15, and its gateway (the host) 10.0.2.1.
 #
-# A fresh host directory per test, with greeting.txt, is mounted read-only at
-# /mnt/host over virtio-9p (its mount tag).
+# Two fresh host directories per test, $t.share and $t.volume, each with
+# greeting.txt and writable by all, are shared over virtio-9p by mount tag
+# (PATH[:MODE]), read-only on the host but for /mnt/rw:
+#   /mnt/host             $t.share
+#   /mnt/ro:ro            $t.volume
+#   /mnt/rw:rw            $t.volume
+#   /data:ro              $t.share, over the image's /data
+#   /mnt/host/nested:ro   $t.volume
 #
 # Usage: dev_tools/run_linux_on_vm_userland.sh [-t <test>]... [-r] [-v]
 #   -t   test to run, e.g. hello (repeatable; default: every test)
@@ -119,6 +126,8 @@ while read -r lib; do
     mkdir -p "$WORK/rootfs$(dirname "$lib")"
     cp -L "$lib" "$WORK/rootfs$lib"
 done <<<"$libs"
+mkdir "$WORK/rootfs/data"
+echo "from the image" >"$WORK/rootfs/data/image.txt"
 # Files only: the broker's root infers directories from paths.
 (cd "$WORK/rootfs" && find . -type f -printf '%P\n' |
     tar --format=ustar --owner=0 --group=0 -cf "$WORK/rootfs.tar" -T -)
@@ -150,12 +159,25 @@ network_args() {
         -device virtio-net-pci,netdev=n0,disable-legacy=on
 }
 
-# The virtio-9p share for test $1: see the header.
+# The virtio-9p shares for test $1: see the header.
 share_args() {
-    mkdir "$WORK/$1.share"
-    echo "hello from the host" >"$WORK/$1.share/greeting.txt"
-    echo -fsdev "local,id=fs0,path=$WORK/$1.share,security_model=none" \
-        -device virtio-9p-pci,fsdev=fs0,mount_tag=/mnt/host,disable-legacy=on
+    local dir
+    for dir in "$WORK/$1.share" "$WORK/$1.volume"; do
+        mkdir "$dir"
+        echo "hello from the host" >"$dir/greeting.txt"
+        chmod a+rwx "$dir"
+        chmod a+rw "$dir/greeting.txt"
+    done
+    echo -fsdev "local,id=fs0,path=$WORK/$1.share,security_model=none,readonly=on" \
+        -device virtio-9p-pci,fsdev=fs0,mount_tag=/mnt/host,disable-legacy=on \
+        -fsdev "local,id=fs1,path=$WORK/$1.volume,security_model=none,readonly=on" \
+        -device virtio-9p-pci,fsdev=fs1,mount_tag=/mnt/ro:ro,disable-legacy=on \
+        -fsdev "local,id=fs2,path=$WORK/$1.volume,security_model=none" \
+        -device virtio-9p-pci,fsdev=fs2,mount_tag=/mnt/rw:rw,disable-legacy=on \
+        -fsdev "local,id=fs3,path=$WORK/$1.share,security_model=none,readonly=on" \
+        -device virtio-9p-pci,fsdev=fs3,mount_tag=/data:ro,disable-legacy=on \
+        -fsdev "local,id=fs4,path=$WORK/$1.volume,security_model=none,readonly=on" \
+        -device virtio-9p-pci,fsdev=fs4,mount_tag=/mnt/host/nested:ro,disable-legacy=on
 }
 
 # The kernel checks the output; this only shows it.

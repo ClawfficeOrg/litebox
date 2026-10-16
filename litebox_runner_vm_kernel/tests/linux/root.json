@@ -1,0 +1,14 @@
+[
+  {
+    "argv": ["/root", "write"],
+    "expect_stdout": "in memory\n"
+  },
+  {
+    "argv": ["/root-pie"],
+    "expect_stdout": "in memory\n"
+  },
+  {
+    "argv": ["/root-dyn"],
+    "expect_stdout": "in memory\n"
+  }
+]
