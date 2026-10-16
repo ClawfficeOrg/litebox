@@ -11,8 +11,8 @@ use litebox_common_linux::{ProtFlags, errno::Errno, vmem::PAGE_SIZE};
 use litebox_syscall_rewriter::aarch64::{CodeScanRanges, ElfCodeMetadata};
 use zerocopy::FromZeros as _;
 
-use super::{ElfPatchKey, ElfPatchState};
-use crate::{ShimPlatform, Task, UserPtrMut};
+use super::{ElfPatchState, read_file_exact_at};
+use crate::{ShimPlatform, Task, UserPtrMut, syscalls::file::File};
 
 /// Pre-patched AArch64 trampolines are populated (and their gates finalized)
 /// whenever a file mapping becomes executable, including through `mprotect`.
@@ -174,32 +174,24 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// Returns the arch state and the page-aligned trampoline capacity. Falls
     /// back to one page (with trap fallback on exhaustion) if scanning fails.
-    pub(super) fn plan_runtime_trampoline(&self, fd: &ElfPatchKey) -> (ArchPatchState, usize) {
-        let scanned = self
-            .global
-            .litebox
-            .file_status(&fd.0)
-            .ok()
-            .and_then(|stat| {
-                let file_size = usize::try_from(stat.size).ok()?;
-                let word_len = file_size.div_ceil(8);
-                let mut words = u64::new_vec_zeroed(word_len).ok()?;
-                let bytes = zerocopy::IntoBytes::as_mut_bytes(words.as_mut_slice());
-                self.read_file_exact_at(&fd.0, &mut bytes[..file_size], 0)
-                    .ok()?;
-                let metadata =
-                    ElfCodeMetadata::parse_aligned_in_place(&mut words, file_size).ok()?;
-                let upper_bound = metadata
-                    .trampoline_size_upper_bound(
-                        &zerocopy::IntoBytes::as_bytes(words.as_slice())[..file_size],
-                        crate::aarch64_rewrite_options(),
-                    )
-                    .ok();
-                Some((metadata, upper_bound))
-            });
+    pub(super) fn plan_runtime_trampoline(file: &File<Platform>) -> (ArchPatchState, usize) {
+        let scanned = file.status().ok().and_then(|stat| {
+            let file_size = usize::try_from(stat.size).ok()?;
+            let word_len = file_size.div_ceil(8);
+            let mut words = u64::new_vec_zeroed(word_len).ok()?;
+            let bytes = zerocopy::IntoBytes::as_mut_bytes(words.as_mut_slice());
+            read_file_exact_at(file, &mut bytes[..file_size], 0).ok()?;
+            let metadata = ElfCodeMetadata::parse_aligned_in_place(&mut words, file_size).ok()?;
+            let upper_bound = metadata
+                .trampoline_size_upper_bound(
+                    &zerocopy::IntoBytes::as_bytes(words.as_slice())[..file_size],
+                    crate::aarch64_rewrite_options(),
+                )
+                .ok();
+            Some((metadata, upper_bound))
+        });
         let Some((metadata, upper_bound)) = scanned else {
             litebox_util_log::warn!(
-                fd:? = fd;
                 "AArch64 ELF pre-scan unavailable; using one-page trampoline with trap fallback"
             );
             return (ArchPatchState::default(), PAGE_SIZE);
@@ -216,12 +208,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .unwrap_or(PAGE_SIZE);
         if upper_bound.is_none() {
             litebox_util_log::warn!(
-                fd:? = fd;
                 "AArch64 trampoline size estimate unavailable; using one-page trampoline with trap fallback"
             );
         }
         litebox_util_log::debug!(
-            fd:? = fd,
             executable_bytes:? = executable_bytes,
             identified_bytes:? = identified_bytes,
             trampoline_upper_bound:? = upper_bound,

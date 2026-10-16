@@ -27,7 +27,7 @@ struct ElfFile<'a, Platform: ShimPlatform> {
     task: &'a Task<Platform>,
     fd: i32,
     #[cfg(target_arch = "aarch64")]
-    file_fd: alloc::sync::Arc<crate::FileFd>,
+    file_fd: alloc::sync::Arc<crate::syscalls::file::FileFd<Platform>>,
     load_high: bool,
     reserve_runtime_trampoline: bool,
 }
@@ -38,7 +38,7 @@ impl<'a, Platform: ShimPlatform> ElfFile<'a, Platform> {
             .sys_open(path, OFlags::RDONLY, Mode::empty())?
             .reinterpret_as_signed();
         #[cfg(target_arch = "aarch64")]
-        let Ok(crate::syscalls::file::AnyTypedFd::Fs(file_fd)) = task.typed_fd(fd) else {
+        let Ok(crate::syscalls::file::AnyTypedFd::File(file_fd)) = task.typed_fd(fd) else {
             let _ = task.sys_close(fd);
             return Err(Errno::EBADF);
         };

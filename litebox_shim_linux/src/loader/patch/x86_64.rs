@@ -8,8 +8,8 @@ use core::ops::Range;
 
 use litebox_common_linux::{ProtFlags, errno::Errno};
 
-use super::{ElfPatchKey, ElfPatchState};
-use crate::{ShimPlatform, Task, UserPtrMut};
+use super::ElfPatchState;
+use crate::{ShimPlatform, Task, UserPtrMut, syscalls::file::File};
 
 /// Fixed size of every runtime trampoline.
 pub(super) const RUNTIME_TRAMPOLINE_SIZE: usize =
@@ -85,8 +85,7 @@ impl CodeRewriter {
 
 impl<Platform: ShimPlatform> Task<Platform> {
     /// Returns the arch state and capacity of an unpatched file's runtime trampoline.
-    #[expect(clippy::unused_self, reason = "shared interface with AArch64")]
-    pub(super) fn plan_runtime_trampoline(&self, _fd: &ElfPatchKey) -> (ArchPatchState, usize) {
+    pub(super) fn plan_runtime_trampoline(_file: &File<Platform>) -> (ArchPatchState, usize) {
         (ArchPatchState {}, RUNTIME_TRAMPOLINE_SIZE)
     }
 
