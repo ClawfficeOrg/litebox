@@ -9,13 +9,16 @@
 # Every litebox_runner_vm_kernel/tests/linux/<name>.c is compiled three times,
 # as /<name> (static), /<name>-pie (static PIE), and /<name>-dyn (dynamically
 # linked), or, if in DYNAMIC_ONLY, only as /<name>-dyn, into rootfs.tar, the
-# broker's root image, with /data/image.txt. As in
-# litebox_runner_linux_userland's tests, the root also has the dynamic
-# programs' shared libraries and interpreter, as ldd lists them, and
-# libgcc_s.so.1, at their host paths; as the root has no symbolic links, they
-# are copies of what the links name. The shim patches their syscalls as the
-# programs map them. The root is packed with the userland runner and a test's
-# runs into a tar passed as the initrd.
+# broker's root image, with /data/image.txt, /etc/greeting.txt, and
+# /etc/image.txt. As in litebox_runner_linux_userland's tests, the root also
+# has the dynamic programs' shared libraries and interpreter, as ldd lists
+# them, and libgcc_s.so.1, at their host paths; as the root has no symbolic
+# links, they are copies of what the links name. The shim patches their
+# syscalls as the programs map them. layer.tar, all writable by all, has its
+# own /etc/greeting.txt and /etc/layer.txt. A test's <test>.config.json, if
+# any, is the payload's config.json (see
+# litebox_runner_vm_kernel/src/payload.rs). These, the userland runner, and a
+# test's runs are packed into a tar passed as the initrd.
 #
 # A test is litebox_runner_vm_kernel/tests/linux/<test>.json, the kernel's
 # programs.json (see litebox_runner_vm_kernel/src/client/program.rs), which
@@ -82,7 +85,9 @@ while getopts "t:rvh" opt; do
     esac
 done
 if [[ ${#tests[@]} -eq 0 ]]; then
-    for f in "$TESTS_DIR"/*.json; do tests+=("$(basename "$f" .json)"); done
+    for f in "$TESTS_DIR"/*.json; do
+        [[ $f == *.config.json ]] || tests+=("$(basename "$f" .json)")
+    done
 fi
 
 # The userland runner has its own target directory.
@@ -126,11 +131,18 @@ while read -r lib; do
     mkdir -p "$WORK/rootfs$(dirname "$lib")"
     cp -L "$lib" "$WORK/rootfs$lib"
 done <<<"$libs"
-mkdir "$WORK/rootfs/data"
+mkdir -p "$WORK/rootfs/data" "$WORK/rootfs/etc" "$WORK/layer/etc"
 echo "from the image" >"$WORK/rootfs/data/image.txt"
+echo "from the image" >"$WORK/rootfs/etc/greeting.txt"
+echo "from the image" >"$WORK/rootfs/etc/image.txt"
+echo "from the layer" >"$WORK/layer/etc/greeting.txt"
+echo "only in the layer" >"$WORK/layer/etc/layer.txt"
+chmod -R a+rwX "$WORK/layer"
 # Files only: the broker's root infers directories from paths.
-(cd "$WORK/rootfs" && find . -type f -printf '%P\n' |
-    tar --format=ustar --owner=0 --group=0 -cf "$WORK/rootfs.tar" -T -)
+for image in rootfs layer; do
+    (cd "$WORK/$image" && find . -type f -printf '%P\n' |
+        tar --format=ustar --owner=0 --group=0 -cf "$WORK/$image.tar" -T -)
+done
 
 # The virtio console's files for test $1: its output, and the FIFO of its
 # input if it has any (see `feed_input`).
@@ -194,9 +206,14 @@ for t in "${tests[@]}"; do
     [[ -f "$TESTS_DIR/$t.json" ]] || { echo "error: no test $TESTS_DIR/$t.json" >&2; exit 2; }
     mkdir -p "$WORK/$t"
     cp "$USERLAND" "$WORK/$t/runner.elf"
-    cp "$WORK/rootfs.tar" "$WORK/$t/rootfs.tar"
+    cp "$WORK/rootfs.tar" "$WORK/layer.tar" "$WORK/$t/"
     cp "$TESTS_DIR/$t.json" "$WORK/$t/programs.json"
-    tar --format=ustar -cf "$WORK/$t.tar" -C "$WORK/$t" runner.elf rootfs.tar programs.json
+    payload=(runner.elf rootfs.tar layer.tar programs.json)
+    if [[ -f "$TESTS_DIR/$t.config.json" ]]; then
+        cp "$TESTS_DIR/$t.config.json" "$WORK/$t/config.json"
+        payload+=(config.json)
+    fi
+    tar --format=ustar -cf "$WORK/$t.tar" -C "$WORK/$t" "${payload[@]}"
     failed_before=$fail
     : >"$WORK/$t.stdout"
     feeder=

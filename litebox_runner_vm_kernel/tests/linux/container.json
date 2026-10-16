@@ -1,0 +1,5 @@
+[
+  {"argv": ["/container", "write"], "expect_stdout": "from the image\nread-only\ntmpfs\n"},
+  {"argv": ["/container-pie"], "expect_stdout": "from the image\nread-only\ntmpfs\n"},
+  {"argv": ["/container-dyn"], "expect_stdout": "from the image\nread-only\ntmpfs\n"}
+]

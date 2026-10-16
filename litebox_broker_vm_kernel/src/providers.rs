@@ -3,20 +3,26 @@
 
 //! The broker core's providers: hardware randomness, timers, `/dev` (standard
 //! streams from the runner's [`StdioProvider`], `null`, `urandom`),
-//! the root, host directories ([`Share`]s) over 9P, and sockets.
+//! the root ([`Root`]), in-memory directories, host directories
+//! ([`Share`]s) over 9P, and sockets.
 
+use crate::Root;
 use crate::share::{self, Share};
 use alloc::borrow::ToOwned;
+use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use litebox_broker_core::{
     BrokerCore, BrokerCoreLimits, CallerCredential, DestinationPortRange, DestinationRule,
     Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy,
     fs::{
-        FileService, Mode, UserInfo,
-        composer::Composer,
+        FileService, Mode, OFlags, UserInfo,
+        backend::{Backend, HandleRef},
+        composer::{Composer, ComposerBuilder},
         devices::Devices,
         in_mem::{InMem, InitialNode},
+        inode_allocator::InodeAllocator,
         overlay::Overlay,
         resolver::Resolver,
         tar_ro::{EMPTY_TAR_FILE, TarRo},
@@ -38,33 +44,79 @@ impl RandomProvider for HardwareRandom {
     }
 }
 
+/// No sticky bit: modes here have none.
+const RWX_ALL: Mode = Mode::RWXU.union(Mode::RWXG).union(Mode::RWXO);
+
+const WRITABLE_BY_ALL: InitialNode = InitialNode::Directory {
+    mode: RWX_ALL,
+    owner: UserInfo::ROOT,
+};
+
+/// With the mount's allocator, so on a device of its own, unlike
+/// `InMem::new_initialized`'s.
+fn tmpfs(allocator: InodeAllocator) -> InMem<VmKernel> {
+    let fs = InMem::<VmKernel>::new(allocator);
+    let root = fs
+        .owned_dir_at(fs.root(), OFlags::PATH)
+        .expect("an in-memory root opens");
+    fs.chmod(HandleRef::Dir(&root), RWX_ALL)
+        .expect("an in-memory root's mode changes");
+    fs
+}
+
+/// A writable root is an overlay: the image layers, merged, under an
+/// in-memory layer, with `/tmp`, that takes writes. A read-only root is its one
+/// layer, mounted directly.
+///
+/// TODO(broker core, as in userland): the resolver skips permission checks on
+/// backend roots (`/`, mount roots), and authorizes an open after the backend
+/// opens it, so a denied `O_TRUNC` still copies up an empty file.
+///
 /// # Panics
 ///
-/// If a share cannot be mounted, as `--mount` fails userland's broker.
+/// If read-only with more than one layer.
+fn mount_root(composer: ComposerBuilder, root: Root) -> ComposerBuilder {
+    let Root {
+        mut layers,
+        writable,
+    } = root;
+    if layers.is_empty() {
+        layers.push(EMPTY_TAR_FILE);
+    }
+    if !writable {
+        let [image] = layers[..] else {
+            panic!("a read-only root takes one layer");
+        };
+        return composer.mount("/", |allocator| TarRo::new(image.into(), allocator));
+    }
+    composer.mount_nestable("/", |allocators| {
+        let upper = InMem::<VmKernel>::new_initialized([("/tmp".to_owned(), WRITABLE_BY_ALL)]);
+        // An overlay's lowers go highest first.
+        let lowers = layers
+            .iter()
+            .rev()
+            .map(|layer| Box::new(TarRo::new((*layer).into(), allocators.next())) as _)
+            .collect();
+        Overlay::<VmKernel>::with_boxed_lowers(upper, lowers, allocators.next())
+    })
+}
+
+/// # Panics
+///
+/// If a share cannot be mounted, as `--mount` fails userland's broker, or a
+/// mount path is invalid or taken.
 fn file_service(
-    root: Option<&'static [u8]>,
+    root: Root,
+    tmpfs_paths: Vec<String>,
     shares: Vec<Share>,
     stdio: Arc<dyn StdioProvider>,
     random: Arc<dyn RandomProvider>,
 ) -> Arc<dyn FileService> {
-    // TODO(broker core, as in userland): the resolver skips permission checks
-    // on backend roots (`/`, mount roots), and authorizes an open after the
-    // backend opens it, so a denied `O_TRUNC` still copies up an empty file.
-    let writable = InitialNode::Directory {
-        mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
-        owner: UserInfo::ROOT,
-    };
-    let upper = InMem::<VmKernel>::new_initialized([("/tmp".to_owned(), writable)]);
-    let image = root.unwrap_or(EMPTY_TAR_FILE);
-    let mut composer = Composer::builder()
-        .mount_nestable("/", |allocators| {
-            Overlay::<VmKernel>::new(
-                upper,
-                TarRo::new(image.into(), allocators.next()),
-                allocators.next(),
-            )
-        })
+    let mut composer = mount_root(Composer::builder(), root)
         .mount("/dev", |allocator| Devices::new(allocator, stdio, random));
+    for path in tmpfs_paths {
+        composer = composer.mount(&path, tmpfs);
+    }
     for share in shares {
         let path = share.path.clone();
         composer = share::mount(composer, share)
@@ -115,10 +167,12 @@ pub(crate) fn seed() -> u64 {
 ///
 /// # Panics
 ///
-/// Without a hardware CSPRNG, on a second call, or if a share cannot be
-/// mounted.
+/// Without a hardware CSPRNG, on a second call, if a share cannot be
+/// mounted, if a mount path is invalid or taken, or if a read-only root has
+/// more than one layer.
 pub(crate) fn core(
-    root: Option<&'static [u8]>,
+    root: Root,
+    tmpfs: Vec<String>,
     shares: Vec<Share>,
     stdio: Arc<dyn StdioProvider>,
     timers: Arc<dyn TimerProvider>,
@@ -133,7 +187,7 @@ pub(crate) fn core(
         sockets,
         Arc::clone(&random),
         timers,
-        file_service(root, shares, stdio, random),
+        file_service(root, tmpfs, shares, stdio, random),
     )
     .unwrap_or_else(|error| panic!("broker core: {error:?}"))
 }

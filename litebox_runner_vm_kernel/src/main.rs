@@ -40,12 +40,14 @@ fn kernel_main(kernel: Kernel) -> ! {
         payload::Payload::read(kernel.boot_info).unwrap_or_else(|e| panic!("payload: {e}"));
     let devices = devices::Devices::init(kernel.platform, kernel.clock);
     let wall_clock = devices::wall_clock(kernel.platform, kernel.clock);
+    let (root, tmpfs) = payload.container();
     let broker = |console, shares| {
         litebox_broker_vm_kernel::Broker::new(litebox_broker_vm_kernel::Config {
             platform: kernel.platform,
             console,
             events: devices,
-            root: payload.file("rootfs.tar"),
+            root,
+            tmpfs,
             shares,
             network: devices.network(),
         })

@@ -371,8 +371,7 @@ impl Transport for ShareTransport {
 }
 
 /// `PATH[:MODE]`, as `docker run -v`'s: `ro`, `rw`, or `O` (the default,
-/// podman's overlay). The broker's `Composer` panics on relative or
-/// unnormalized paths; `/` and `/dev` are taken. Tags come from the host.
+/// podman's overlay). Tags come from the host.
 fn mount_spec(tag: &[u8]) -> Option<(String, ShareMode)> {
     let tag = core::str::from_utf8(tag).ok()?;
     let (path, mode) = match tag.rsplit_once(':') {
@@ -382,10 +381,18 @@ fn mount_spec(tag: &[u8]) -> Option<(String, ShareMode)> {
         Some((path, "O")) => (path, ShareMode::Overlay),
         Some(_) => return None,
     };
-    let mut components = path.strip_prefix('/')?.split('/');
-    let valid = components
+    mount_path(path).then(|| (String::from(path), mode))
+}
+
+/// The broker's `Composer` panics on relative or unnormalized paths; `/` and
+/// `/dev` are taken.
+pub fn mount_path(path: &str) -> bool {
+    let Some(path) = path.strip_prefix('/') else {
+        return false;
+    };
+    let mut components = path.split('/');
+    components
         .clone()
         .all(|component| !matches!(component, "" | "." | ".."))
-        && components.next() != Some("dev");
-    valid.then(|| (String::from(path), mode))
+        && components.next() != Some("dev")
 }

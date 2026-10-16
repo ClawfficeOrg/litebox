@@ -9,8 +9,9 @@
 //! buffers.
 //!
 //! Files are the devices under `/dev`, with standard streams on the
-//! runner's [`stdio::Console`], the root ([`Config::root`]), and host
-//! directories ([`Config::shares`]).
+//! runner's [`stdio::Console`], the root ([`Config::root`]), in-memory
+//! directories ([`Config::tmpfs`]), and host directories
+//! ([`Config::shares`]).
 //! Timers are on the kernel clock. IPv4 TCP and UDP
 //! sockets are `litebox_broker_smoltcp`'s, which mediates their traffic:
 //! between runner processes directly, and, with the runner's [`Network`]
@@ -36,6 +37,7 @@ pub mod stdio;
 mod timers;
 
 use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
@@ -90,12 +92,21 @@ pub struct Config {
     /// Behind `/dev/stdin`, `/dev/stdout`, and `/dev/stderr`.
     pub console: &'static dyn stdio::Console,
     pub events: &'static dyn Events,
-    /// The image under `/`'s in-memory layer, which has `/tmp` writable by
-    /// all. Writes are lost at shutdown.
-    pub root: Option<&'static [u8]>,
+    pub root: Root,
+    /// Writable by all. Paths as [`share::Share::path`].
+    pub tmpfs: Vec<String>,
     pub shares: Vec<share::Share>,
     /// The network sockets reach beyond the guest, if any.
     pub network: Option<&'static dyn Network>,
+}
+
+pub struct Root {
+    /// Tars, lowest first; at most one unless writable. OCI whiteouts (`.wh.`
+    /// files) are not interpreted.
+    pub layers: Vec<&'static [u8]>,
+    /// Overlays an in-memory layer, with `/tmp` writable by all, on the
+    /// layers. Writes are lost at shutdown.
+    pub writable: bool,
 }
 
 /// The kernel's broker; clones share it.
@@ -116,8 +127,9 @@ impl Broker {
     ///
     /// # Panics
     ///
-    /// Without a hardware CSPRNG, on a second call, or if a share cannot be
-    /// mounted.
+    /// Without a hardware CSPRNG, on a second call, if a share cannot be
+    /// mounted, if a mount path is invalid or taken, or if a read-only root
+    /// has more than one layer.
     pub fn new(config: Config) -> Self {
         let stdio = Arc::new(ConsoleStdio::new(config.console));
         let timers = Arc::new(KernelTimers::new(config.platform));
@@ -131,6 +143,7 @@ impl Broker {
         Self {
             core: providers::core(
                 config.root,
+                config.tmpfs,
                 config.shares,
                 stdio.clone(),
                 timers.clone(),

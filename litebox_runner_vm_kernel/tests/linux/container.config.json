@@ -1,0 +1,37 @@
+{
+  "ociVersion": "1.2.0",
+  "root": {
+    "path": "rootfs.tar",
+    "readonly": true
+  },
+  "mounts": [
+    {
+      "destination": "/proc",
+      "type": "proc",
+      "source": "proc"
+    },
+    {
+      "destination": "/dev/shm",
+      "type": "tmpfs",
+      "source": "shm",
+      "options": [
+        "nosuid",
+        "mode=1777"
+      ]
+    },
+    {
+      "destination": "/run",
+      "type": "tmpfs",
+      "source": "tmpfs",
+      "options": [
+        "nosuid",
+        "mode=755"
+      ]
+    },
+    {
+      "destination": "/var/tmp",
+      "type": "tmpfs",
+      "source": "tmpfs"
+    }
+  ]
+}

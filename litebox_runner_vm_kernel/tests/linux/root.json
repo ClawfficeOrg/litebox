@@ -1,14 +1,5 @@
 [
-  {
-    "argv": ["/root", "write"],
-    "expect_stdout": "in memory\n"
-  },
-  {
-    "argv": ["/root-pie"],
-    "expect_stdout": "in memory\n"
-  },
-  {
-    "argv": ["/root-dyn"],
-    "expect_stdout": "in memory\n"
-  }
+  {"argv": ["/root", "write"], "expect_stdout": "from the layer\nand from the guest\nonly in the layer\nfrom the image\nin memory\n"},
+  {"argv": ["/root-pie"], "expect_stdout": "from the layer\nand from the guest\nonly in the layer\nfrom the image\nin memory\n"},
+  {"argv": ["/root-dyn"], "expect_stdout": "from the layer\nand from the guest\nonly in the layer\nfrom the image\nin memory\n"}
 ]
