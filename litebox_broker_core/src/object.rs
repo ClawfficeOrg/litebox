@@ -41,8 +41,8 @@ pub(crate) struct ObjectReference {
     pub(crate) process_reference_index: usize,
     /// Readiness publication for kinds whose state changes outside this
     /// process's requests, retired when this reference drops. Pipes publish
-    /// once shared with another process; files whose reads or writes can
-    /// fail with `WouldBlock` publish from the start.
+    /// once shared with another process; sockets, and files whose reads or
+    /// writes can fail with `WouldBlock`, publish from the start.
     pub(crate) readiness: Option<ReadinessRegistration>,
 }
 
@@ -72,9 +72,10 @@ impl ObjectEntry {
             | Self::File(_)
             | Self::UnixSocket(_)
             | Self::Pipe(_)
+            | Self::Socket(_)
             | Self::Timer(_)
             | Self::ReadinessQueue(_) => true,
-            Self::Socket(_) | Self::Signals(_) => false,
+            Self::Signals(_) => false,
         }
     }
 
@@ -96,9 +97,10 @@ impl ObjectEntry {
             Self::Event(event) => watch(&|registration| event.watch(registration)),
             Self::UnixSocket(socket) => watch(&|registration| socket.watch(registration)),
             Self::Pipe(pipe) => watch(&|registration| pipe.watch(registration)),
+            Self::Socket(socket) => watch(&|registration| socket.watch(registration)),
             Self::Timer(timer) => watch(&|registration| timer.watch(registration)),
             Self::ReadinessQueue(queue) => watch(&|registration| queue.watch(registration)),
-            Self::Socket(_) | Self::Signals(_) => Ok(None),
+            Self::Signals(_) => Ok(None),
         }
     }
 
@@ -207,7 +209,8 @@ pub(crate) fn get_status_flags(
         ObjectEntry::Pipe(pipe) => return Ok(pipe.get_status_flags()),
         ObjectEntry::Timer(timer) => return Ok(timer.get_status_flags()),
         ObjectEntry::ReadinessQueue(queue) => return Ok(queue.get_status_flags()),
-        ObjectEntry::Socket(_) | ObjectEntry::Signals(_) => return Err(BrokerError::InvalidRights),
+        ObjectEntry::Socket(socket) => return Ok(socket.get_status_flags()),
+        ObjectEntry::Signals(_) => return Err(BrokerError::InvalidRights),
     };
     crate::fs::get_status_flags(process, &file)
 }
@@ -241,7 +244,11 @@ pub(crate) fn set_status_flags(
             queue.set_status_flags(mask, flags);
             return Ok(());
         }
-        ObjectEntry::Socket(_) | ObjectEntry::Signals(_) => return Err(BrokerError::InvalidRights),
+        ObjectEntry::Socket(socket) => {
+            socket.set_status_flags(mask, flags);
+            return Ok(());
+        }
+        ObjectEntry::Signals(_) => return Err(BrokerError::InvalidRights),
     };
     crate::fs::set_status_flags(process, &file, mask, flags)
 }

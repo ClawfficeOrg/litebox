@@ -7,22 +7,27 @@
 use alloc::{sync::Arc, vec::Vec};
 use core::fmt;
 use core::net::{Ipv4Addr, SocketAddrV4};
+use core::sync::atomic::AtomicUsize;
+use core::time::Duration;
 
 use hashbrown::HashSet;
 use litebox_broker_protocol::ObjectHandle;
+use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags, FileStatusFlags};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
     CreateSocketRequest, IpProtocol, MAX_SOCKET_TRANSFER_SIZE, MAX_TCP_LISTEN_BACKLOG,
     MAX_UDP_DATAGRAM_SIZE, ReceiveFlags, ReceiveFromFlags, SendFlags, ShutdownMode,
-    SocketConnectionStatus, SocketError, SocketOutcome, SocketStatusResponse, SocketType,
-    TcpOptionName, TcpOptionValue,
+    SocketConnectionStatus, SocketError, SocketOptionName, SocketOptionValue, SocketOutcome,
+    SocketType,
 };
-use spin::Mutex;
+use spin::{Mutex, RwLock};
 
-use crate::object::{ObjectEntry, ObjectRights};
+use crate::id::IdAllocator;
+use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
+use crate::process::PendingObjectReference;
 use crate::quota::QuotaReservation;
 use crate::readiness::{ReadinessRegistration, ReadinessSink, SharedReadinessWatchers};
-use crate::{BrokerError, BrokerProcess, ProcessId, Result};
+use crate::{BrokerCore, BrokerError, BrokerProcess, ProcessId, Result};
 
 const DEFAULT_TCP_LISTEN_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
 const DEFAULT_LOCAL_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
@@ -470,8 +475,12 @@ pub trait SocketProvider: Send + Sync {
         readiness: ReadinessRegistration,
     ) -> Result<Arc<dyn PlatformSocket>>;
 
-    /// Releases remaining provider state charged to a process after its socket
-    /// references close.
+    /// Releases remaining provider state charged to a process.
+    ///
+    /// Core calls this once, after the process has released its references
+    /// and every socket charged to it has retired, and does not reuse the
+    /// process's ID before then. A socket stays charged to the process that
+    /// created it, even while other processes share it.
     ///
     /// This is a teardown and accounting boundary, not a separate network
     /// namespace; it must not disturb endpoints owned by other processes.
@@ -511,8 +520,9 @@ pub trait PlatformSocket: Send + Sync {
     ///
     /// When no connection is pending, returns [`BrokerError::WouldBlock`]. The
     /// returned socket follows the readiness contract of
-    /// [`SocketProvider::create`]. On a non-completed return, the provider
-    /// releases all resources allocated for an unreturned socket.
+    /// [`SocketProvider::create`] and is charged to the process this listener
+    /// is charged to. On a non-completed return, the provider releases all
+    /// resources allocated for an unreturned socket.
     fn accept(
         &self,
         readiness: ReadinessRegistration,
@@ -544,8 +554,9 @@ pub trait PlatformSocket: Send + Sync {
 
     /// Sends bytes without waiting for platform readiness.
     ///
-    /// A temporarily full socket returns [`BrokerError::WouldBlock`]. Ordinary
-    /// network failures return [`SocketOutcome::Failed`].
+    /// A temporarily full socket returns [`BrokerError::WouldBlock`]. A socket
+    /// shut down for writing fails with `Shutdown`. Ordinary network failures
+    /// return [`SocketOutcome::Failed`].
     fn send(&self, data: Vec<u8>, flags: SendFlags) -> Result<SocketOutcome<usize>>;
 
     /// Sends one complete datagram without waiting for platform readiness.
@@ -554,9 +565,10 @@ pub trait PlatformSocket: Send + Sync {
     /// the socket's connected peer. An explicit destination is normalized but
     /// remains guest-visible; the provider must validate it with
     /// [`normalize_socket_destination`] before choosing a host-socket target.
-    /// A temporarily full socket returns [`BrokerError::WouldBlock`]. Partial
-    /// successful sends are invalid. Resource failures are broker errors rather
-    /// than ordinary socket failures.
+    /// A temporarily full socket returns [`BrokerError::WouldBlock`], and a
+    /// socket shut down for writing fails with `Shutdown`. Partial successful
+    /// sends are invalid. Resource failures are broker errors rather than
+    /// ordinary socket failures.
     fn send_to(
         &self,
         data: Vec<u8>,
@@ -569,8 +581,16 @@ pub trait PlatformSocket: Send + Sync {
     /// A temporarily empty socket returns [`BrokerError::WouldBlock`]. End of
     /// stream returns [`PlatformStreamReceive::EndOfStream`]. The core handles
     /// zero-length receives without invoking the platform.
+    ///
+    /// `reader` identifies the reference receiving. A peek longer than one
+    /// transfer takes one request at each offset, starting from zero, by the
+    /// same reader. A request past offset zero returns
+    /// [`BrokerError::WouldBlock`] if another receive came after that reader's
+    /// request at offset zero, since the bytes it would return might not
+    /// follow those already returned.
     fn receive(
         &self,
+        reader: ObjectHandle,
         length: usize,
         flags: ReceiveFlags,
         peek_offset: u32,
@@ -597,11 +617,15 @@ pub trait PlatformSocket: Send + Sync {
     /// failure must leave the listener active and retryable.
     fn shutdown(&self, mode: ShutdownMode) -> Result<SocketOutcome<()>>;
 
-    /// Sets a typed TCP socket option.
-    fn set_tcp_option(&self, value: TcpOptionValue) -> Result<()>;
+    /// Sets a TCP socket's [`SocketOptionValue::NoDelay`] or
+    /// [`SocketOptionValue::KeepAlive`], which the transport implements.
+    ///
+    /// A socket accepted from a listener starts with the listener's values.
+    fn set_tcp_option(&self, value: SocketOptionValue) -> Result<()>;
 
-    /// Reads a typed TCP socket option.
-    fn get_tcp_option(&self, name: TcpOptionName) -> Result<TcpOptionValue>;
+    /// Reads a TCP socket's [`SocketOptionName::NoDelay`] or
+    /// [`SocketOptionName::KeepAlive`].
+    fn get_tcp_option(&self, name: SocketOptionName) -> Result<SocketOptionValue>;
 
     /// Returns platform-observed socket state and consumes at most one pending
     /// error.
@@ -646,24 +670,24 @@ impl SocketProvider for UnsupportedSocketProvider {
 }
 
 /// Creates a broker-owned socket.
+///
+/// The socket starts with the status flags `request.flags`, which must be
+/// within [`FileOpenFlags::STATUS`].
 pub fn create(
     process: &BrokerProcess,
     request: CreateSocketRequest,
     readiness_sink: Arc<dyn ReadinessSink>,
 ) -> Result<ObjectHandle> {
+    let status = StatusFlags::new(request.flags)?;
     let rights = process
         .core
         .policy
         .authorize_socket_create(process.caller_credential, request)?;
-    let quota = Arc::new(reserve_socket(process)?);
+    let account = process.socket_account()?;
+    let quota = Arc::new(reserve_socket(&process.core, &account)?);
     let reference = process.reserve_object_reference(rights)?;
-    let watchers = SharedReadinessWatchers::default();
-    let readiness_sink = Arc::new(SocketReadinessSink {
-        owner: readiness_sink,
-        watchers: watchers.clone(),
-    });
-    let readiness =
-        ReadinessRegistration::new_with_retirement_guard(reference.handle(), readiness_sink, quota);
+    let (registration, socket_sink, readiness) =
+        socket_readiness(&reference, readiness_sink, quota)?;
     let platform_socket =
         match process
             .core
@@ -682,33 +706,215 @@ pub fn create(
     let resource = Arc::new(SocketResource {
         platform_socket,
         readiness,
-        watchers,
+        readiness_sink: socket_sink,
         port_binding: Mutex::new(None),
         guest_source_lease: Mutex::new(None),
+        error_queries: Mutex::new(()),
+        account,
     });
-    let handle = reference.commit(ObjectEntry::Socket(SocketObject::new(resource, request)))?;
-    Ok(handle)
+    let socket = SocketObject::new(resource, request, status);
+    socket.sync_readiness();
+    reference.commit_with_readiness(ObjectEntry::Socket(socket), Some(registration))
 }
 
-/// Starts a nonblocking connection attempt.
+/// Starts a nonblocking connection attempt, or reports one already started.
 ///
-/// An authorized attempt first binds an unbound socket. TCP connected and
-/// failed states are terminal. UDP connects complete synchronously, and a
-/// failed attempt preserves the previous peer. Policy denial is a per-request
-/// [`SocketOutcome::Failed`] that also preserves existing state.
+/// A stream that is listening or has reported its connection fails with
+/// `AlreadyConnected`, and while an earlier attempt is unreported, a stream
+/// reports it as [`check_connect`] does, except that an attempt still in
+/// progress fails with `AlreadyInProgress`. Port zero and the unspecified
+/// address fail with `ConnectionRefused` without changing the socket.
+/// Otherwise an authorized attempt first binds an unbound socket.
+/// Connect never reports [`SocketConnectionStatus::Failed`]: a failed attempt
+/// is a [`SocketOutcome::Failed`], after which a stream is unconnected but
+/// fails every later attempt the same way. UDP connects complete
+/// synchronously, and a failed attempt preserves the previous peer. Policy
+/// denial is also a [`SocketOutcome::Failed`] that preserves existing state.
 pub fn connect(
     process: &BrokerProcess,
     handle: ObjectHandle,
     address: SocketAddrV4,
 ) -> Result<SocketOutcome<SocketConnectionStatus>> {
     let object = process.authorized_object(handle, ObjectRights::WRITE)?;
-    let create_request = {
-        let object = object.read();
-        let ObjectEntry::Socket(socket) = &*object else {
-            return Err(BrokerError::InvalidRights);
-        };
-        socket.create_request
+    let result = if read_socket(&object, |socket| is_udp(socket.create_request))? {
+        connect_datagram(process, &object, address)
+    } else {
+        connect_stream(process, &object, address)
     };
+    sync_readiness(&object);
+    result
+}
+
+fn connect_stream(
+    process: &BrokerProcess,
+    object: &RwLock<ObjectEntry>,
+    address: SocketAddrV4,
+) -> Result<SocketOutcome<SocketConnectionStatus>> {
+    loop {
+        let (view, connected) = read_socket(object, |socket| {
+            (socket.view(), socket.listening || socket.connect_reported)
+        })?;
+        // The socket's state is reported before any problem with the address.
+        if connected {
+            return Ok(SocketOutcome::Failed(SocketError::AlreadyConnected));
+        }
+        if view == SocketConnectionStatus::Unconnected {
+            break;
+        }
+        match check_connect_stream(object)? {
+            SocketOutcome::Completed(SocketConnectionStatus::Connecting) => {
+                return Ok(SocketOutcome::Failed(SocketError::AlreadyInProgress));
+            }
+            // The attempt seen above was abandoned without effect, so this connect starts over
+            // on the unconnected socket.
+            SocketOutcome::Completed(SocketConnectionStatus::Unconnected) => {}
+            outcome => return Ok(outcome),
+        }
+    }
+    if is_unaddressable(address) {
+        return Ok(SocketOutcome::Failed(SocketError::ConnectionRefused));
+    }
+    let status = match transport_connect(process, object, address)? {
+        SocketOutcome::Completed(status) => status,
+        SocketOutcome::Failed(error) => return Ok(SocketOutcome::Failed(error)),
+    };
+    write_socket(object, |socket| match status {
+        SocketConnectionStatus::Connected => {
+            socket.connect_reported = true;
+            SocketOutcome::Completed(status)
+        }
+        SocketConnectionStatus::Failed(error) => {
+            // This attempt reports the failure, so it is not also pending.
+            let _ = socket.disconnect();
+            SocketOutcome::Failed(error)
+        }
+        status => SocketOutcome::Completed(status),
+    })
+}
+
+fn connect_datagram(
+    process: &BrokerProcess,
+    object: &RwLock<ObjectEntry>,
+    address: SocketAddrV4,
+) -> Result<SocketOutcome<SocketConnectionStatus>> {
+    if is_unaddressable(address) {
+        return Ok(SocketOutcome::Failed(SocketError::ConnectionRefused));
+    }
+    Ok(match transport_connect(process, object, address)? {
+        SocketOutcome::Completed(SocketConnectionStatus::Failed(error)) => {
+            SocketOutcome::Failed(error)
+        }
+        outcome => outcome,
+    })
+}
+
+/// Returns whether a connect to `address` is refused without an attempt.
+fn is_unaddressable(address: SocketAddrV4) -> bool {
+    address.port() == 0 || address.ip().is_unspecified()
+}
+
+/// Reports the progress of a connection attempt.
+///
+/// A connected stream is reported connected, so a later [`connect`] fails
+/// with `AlreadyConnected`. A failed stream attempt is reported as a
+/// [`SocketOutcome::Failed`] with its error, unless another operation already
+/// reported it, leaving `ConnectionAborted`, and leaves the socket
+/// unconnected. A socket without an attempt reports `Unconnected`.
+pub fn check_connect(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+) -> Result<SocketOutcome<SocketConnectionStatus>> {
+    let object = process.authorized_object(handle, ObjectRights::WRITE)?;
+    let result = if read_socket(&object, |socket| is_udp(socket.create_request))? {
+        refresh(&object, true);
+        read_socket(&object, |socket| match socket.view() {
+            SocketConnectionStatus::Failed(error) => SocketOutcome::Failed(error),
+            SocketConnectionStatus::Connected => {
+                SocketOutcome::Completed(SocketConnectionStatus::Connected)
+            }
+            _ => SocketOutcome::Completed(SocketConnectionStatus::Unconnected),
+        })
+    } else {
+        check_connect_stream(&object)
+    };
+    sync_readiness(&object);
+    result
+}
+
+fn check_connect_stream(
+    object: &RwLock<ObjectEntry>,
+) -> Result<SocketOutcome<SocketConnectionStatus>> {
+    let (status, _) = transport_status(object, true)?;
+    write_socket(object, |socket| match status.status {
+        SocketConnectionStatus::Failed(_) => SocketOutcome::Failed(
+            socket
+                .disconnect()
+                .unwrap_or(SocketError::ConnectionAborted),
+        ),
+        SocketConnectionStatus::Connected => {
+            socket.connect_reported = true;
+            SocketOutcome::Completed(SocketConnectionStatus::Connected)
+        }
+        status => SocketOutcome::Completed(status),
+    })
+}
+
+/// Returns a socket's local address, or if `peer` is set, the peer's address
+/// while connected.
+pub fn get_name(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+    peer: bool,
+) -> Result<Option<SocketAddrV4>> {
+    let object = process
+        .authorized_object_with_any_rights(handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
+    read_socket(&object, |_| ())?;
+    refresh(&object, !peer);
+    let address = read_socket(&object, |socket| {
+        if peer {
+            socket
+                .peer_address
+                .filter(|_| socket.view() == SocketConnectionStatus::Connected)
+        } else {
+            socket.local_address
+        }
+    });
+    sync_readiness(&object);
+    address
+}
+
+/// Takes a socket's oldest pending error.
+pub fn take_error(process: &BrokerProcess, handle: ObjectHandle) -> Result<Option<SocketError>> {
+    let object = process
+        .authorized_object_with_any_rights(handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
+    read_socket(&object, |_| ())?;
+    refresh(&object, true);
+    let error = take_pending_error(&object);
+    sync_readiness(&object);
+    Ok(error)
+}
+
+/// Makes `error` a socket's oldest pending error.
+///
+/// A socket keeps at most two pending errors, so this may discard the newest.
+pub fn set_error(process: &BrokerProcess, handle: ObjectHandle, error: SocketError) -> Result<()> {
+    let object = process
+        .authorized_object_with_any_rights(handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
+    write_socket(&object, |socket| socket.errors.prepend(error))?;
+    sync_readiness(&object);
+    Ok(())
+}
+
+/// Starts a transport connection attempt.
+///
+/// TCP connected and failed states are terminal. UDP connects complete
+/// synchronously, and a failed attempt preserves the previous peer.
+fn transport_connect(
+    process: &BrokerProcess,
+    object: &RwLock<ObjectEntry>,
+    address: SocketAddrV4,
+) -> Result<SocketOutcome<SocketConnectionStatus>> {
+    let create_request = read_socket(object, |socket| socket.create_request)?;
 
     if address.port() == 0 {
         return Ok(SocketOutcome::Failed(SocketError::ConnectionRefused));
@@ -733,7 +939,7 @@ pub fn connect(
     }
 
     if is_udp(create_request) {
-        return connect_datagram(process, &object, create_request, destination);
+        return transport_connect_datagram(process, object, create_request, destination);
     }
 
     let (resource, needs_bind) = {
@@ -741,19 +947,25 @@ pub fn connect(
         let ObjectEntry::Socket(socket) = &mut *object else {
             return Err(BrokerError::InvalidRights);
         };
+        // Another connect may have changed the state since the caller checked it.
+        if socket.listening || socket.connect_reported {
+            return Ok(SocketOutcome::Failed(SocketError::AlreadyConnected));
+        }
+        if socket.view() == SocketConnectionStatus::Connecting {
+            return Ok(SocketOutcome::Failed(SocketError::AlreadyInProgress));
+        }
         if socket.resource_retired {
             return Ok(SocketOutcome::Completed(socket.connection_status));
         }
-        if socket.connect_in_flight {
-            return Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting));
-        }
-        if socket.configuration_in_flight || socket.listening {
+        if socket.configuration_in_flight {
             return Ok(SocketOutcome::Failed(SocketError::Other));
         }
         if socket.connection_status != SocketConnectionStatus::Unconnected {
             return Ok(SocketOutcome::Completed(socket.connection_status));
         }
         socket.connect_in_flight = true;
+        // The attempt replaces any earlier disconnection.
+        socket.disconnected = false;
         (Arc::clone(&socket.resource), socket.local_address.is_none())
     };
     if needs_bind {
@@ -761,20 +973,20 @@ pub fn connect(
             match reserve_and_bind(process, create_request, &resource, DEFAULT_LOCAL_ADDRESS) {
                 Ok(binding) => binding,
                 Err(error) => {
-                    finish_connect(&object, SocketConnectionStatus::Unconnected);
+                    abandon_connect(object);
                     return Err(error);
                 }
             };
         match binding {
             ReserveAndBindOutcome::Completed(local_address, port_binding) => {
-                attach_binding(&object, local_address, port_binding)?;
+                attach_binding(object, local_address, port_binding)?;
             }
             ReserveAndBindOutcome::Failed(error) => {
-                finish_connect(&object, SocketConnectionStatus::Unconnected);
+                abandon_connect(object);
                 return Ok(SocketOutcome::Failed(error));
             }
             ReserveAndBindOutcome::Retired(port_binding) => {
-                finish_retired_connect(&object);
+                finish_retired_connect(object);
                 retire_before_releasing_binding(&resource, port_binding);
                 return Err(BrokerError::Internal);
             }
@@ -784,13 +996,13 @@ pub fn connect(
         .source_address_for_destination(destination)
         .is_none()
     {
-        finish_connect(&object, SocketConnectionStatus::Unconnected);
+        abandon_connect(object);
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
     let guest_source_lease = match resource.source_lease_for_connect(destination) {
         Ok(lease) => lease,
         Err(error) => {
-            finish_retired_connect(&object);
+            finish_retired_connect(object);
             resource.retire();
             return Err(error);
         }
@@ -800,22 +1012,27 @@ pub fn connect(
         .connect(destination, guest_source_lease)
     {
         Ok(SocketConnectionStatus::Unconnected) => {
-            finish_retired_connect(&object);
+            finish_retired_connect(object);
             resource.retire();
             return Err(BrokerError::Internal);
         }
         Ok(status) => status,
         Err(PlatformConnectError::PeerUnchanged(error)) => {
-            finish_connect(&object, SocketConnectionStatus::Unconnected);
+            abandon_connect(object);
             return Err(error);
         }
         Err(PlatformConnectError::PeerIndeterminate(error)) => {
-            finish_retired_connect(&object);
+            finish_retired_connect(object);
             resource.retire();
             return Err(error);
         }
     };
-    finish_connect(&object, status);
+    let mut object = object.write();
+    if let ObjectEntry::Socket(socket) = &mut *object {
+        socket.connect_in_flight = false;
+        socket.connection_status = status;
+        socket.peer_address = Some(destination);
+    }
     Ok(SocketOutcome::Completed(status))
 }
 
@@ -826,6 +1043,16 @@ pub fn bind(
     address: SocketAddrV4,
 ) -> Result<SocketOutcome<SocketAddrV4>> {
     let object = process.authorized_object(handle, ObjectRights::WRITE)?;
+    let result = transport_bind(process, &object, address);
+    sync_readiness(&object);
+    result
+}
+
+fn transport_bind(
+    process: &BrokerProcess,
+    object: &RwLock<ObjectEntry>,
+    address: SocketAddrV4,
+) -> Result<SocketOutcome<SocketAddrV4>> {
     let (resource, create_request) = {
         let mut object = object.write();
         let ObjectEntry::Socket(socket) = &mut *object else {
@@ -847,20 +1074,20 @@ pub fn bind(
     };
     match reserve_and_bind(process, create_request, &resource, address) {
         Ok(ReserveAndBindOutcome::Completed(local_address, port_binding)) => {
-            finish_configuration(&object, Some(local_address), Some(port_binding), false)?;
+            finish_configuration(object, Some(local_address), Some(port_binding), false)?;
             Ok(SocketOutcome::Completed(local_address))
         }
         Ok(ReserveAndBindOutcome::Failed(error)) => {
-            finish_configuration(&object, None, None, false)?;
+            finish_configuration(object, None, None, false)?;
             Ok(SocketOutcome::Failed(error))
         }
         Ok(ReserveAndBindOutcome::Retired(port_binding)) => {
-            finish_retired_configuration(&object, None, None)?;
+            finish_retired_configuration(object, None, None)?;
             retire_before_releasing_binding(&resource, port_binding);
             Err(BrokerError::Internal)
         }
         Err(error) => {
-            finish_configuration(&object, None, None, false)?;
+            finish_configuration(object, None, None, false)?;
             Err(error)
         }
     }
@@ -879,6 +1106,16 @@ pub fn listen(
         return Err(BrokerError::UnsupportedOperation);
     }
     let object = process.authorized_object(handle, ObjectRights::WRITE)?;
+    let result = transport_listen(process, &object, backlog);
+    sync_readiness(&object);
+    result
+}
+
+fn transport_listen(
+    process: &BrokerProcess,
+    object: &RwLock<ObjectEntry>,
+    backlog: u32,
+) -> Result<SocketOutcome<SocketAddrV4>> {
     let (resource, create_request, existing_local_address) = {
         let mut object = object.write();
         let ObjectEntry::Socket(socket) = &mut *object else {
@@ -915,7 +1152,7 @@ pub fn listen(
         ) {
             Ok(binding) => binding,
             Err(error) => {
-                finish_configuration(&object, None, None, false)?;
+                finish_configuration(object, None, None, false)?;
                 return Err(error);
             }
         };
@@ -925,11 +1162,11 @@ pub fn listen(
                 port_binding = Some(binding);
             }
             ReserveAndBindOutcome::Failed(error) => {
-                finish_configuration(&object, None, None, false)?;
+                finish_configuration(object, None, None, false)?;
                 return Ok(SocketOutcome::Failed(error));
             }
             ReserveAndBindOutcome::Retired(port_binding) => {
-                finish_retired_configuration(&object, None, None)?;
+                finish_retired_configuration(object, None, None)?;
                 retire_before_releasing_binding(&resource, port_binding);
                 return Err(BrokerError::Internal);
             }
@@ -939,32 +1176,40 @@ pub fn listen(
     match resource.platform_socket.listen(backlog) {
         Ok(SocketOutcome::Completed(address)) => {
             if local_address != Some(address) {
-                finish_retired_configuration(&object, local_address, port_binding)?;
+                finish_retired_configuration(object, local_address, port_binding)?;
                 resource.retire();
                 return Err(BrokerError::Internal);
             }
-            finish_configuration(&object, local_address, port_binding, true)?;
+            finish_configuration(object, local_address, port_binding, true)?;
             Ok(SocketOutcome::Completed(address))
         }
         Ok(SocketOutcome::Failed(error)) => {
-            finish_configuration(&object, local_address, port_binding, false)?;
+            finish_configuration(object, local_address, port_binding, false)?;
             Ok(SocketOutcome::Failed(error))
         }
         Err(error) => {
-            finish_configuration(&object, local_address, port_binding, false)?;
+            finish_configuration(object, local_address, port_binding, false)?;
             Err(error)
         }
     }
 }
 
 /// Accepts one pending TCP connection and creates a broker socket capability.
+///
+/// The accepted socket starts with the status flags `flags`, which must be
+/// within [`FileOpenFlags::STATUS`], and default options other than those
+/// [`PlatformSocket::set_tcp_option`] sets. When no connection is pending,
+/// fails with [`BrokerError::WouldBlock`], or with
+/// [`BrokerError::NonBlockingWouldBlock`] if the listener is non-blocking.
 pub fn accept(
     process: &BrokerProcess,
     handle: ObjectHandle,
+    flags: FileOpenFlags,
     readiness_sink: Arc<dyn ReadinessSink>,
 ) -> Result<SocketOutcome<AcceptedBrokerSocket>> {
+    let status = StatusFlags::new(flags)?;
     let listener = process.authorized_object(handle, ObjectRights::WAIT)?;
-    let (listener_resource, create_request) = {
+    let (listener_resource, create_request, nonblocking) = {
         let listener = listener.read();
         let ObjectEntry::Socket(socket) = &*listener else {
             return Err(BrokerError::InvalidRights);
@@ -975,21 +1220,21 @@ pub fn accept(
         if !socket.listening {
             return Ok(SocketOutcome::Failed(SocketError::NotConnected));
         }
-        (Arc::clone(&socket.resource), socket.create_request)
+        (
+            Arc::clone(&socket.resource),
+            socket.create_request,
+            socket.status.nonblocking(),
+        )
     };
     let rights = process
         .core
         .policy
         .principal_object_rights(process.caller_credential)?;
-    let quota = Arc::new(reserve_socket(process)?);
+    // The provider charges an accepted socket to its listener's process.
+    let quota = Arc::new(reserve_socket(&process.core, &listener_resource.account)?);
     let reference = process.reserve_object_reference(rights)?;
-    let watchers = SharedReadinessWatchers::default();
-    let readiness_sink = Arc::new(SocketReadinessSink {
-        owner: readiness_sink,
-        watchers: watchers.clone(),
-    });
-    let readiness =
-        ReadinessRegistration::new_with_retirement_guard(reference.handle(), readiness_sink, quota);
+    let (registration, socket_sink, readiness) =
+        socket_readiness(&reference, readiness_sink, quota)?;
     let accepted = match listener_resource.platform_socket.accept(readiness.clone()) {
         Ok(SocketOutcome::Completed(accepted)) => accepted,
         Ok(SocketOutcome::Failed(error)) => {
@@ -998,7 +1243,7 @@ pub fn accept(
         }
         Err(error) => {
             readiness.retire();
-            return Err(error);
+            return Err(would_block_error(error, nonblocking));
         }
     };
     let AcceptedPlatformSocket {
@@ -1015,12 +1260,22 @@ pub fn accept(
     let resource = Arc::new(SocketResource {
         platform_socket: socket,
         readiness,
-        watchers,
+        readiness_sink: socket_sink,
         port_binding: Mutex::new(None),
         guest_source_lease: Mutex::new(Some(guest_source_lease)),
+        error_queries: Mutex::new(()),
+        account: Arc::clone(&listener_resource.account),
     });
-    let accepted_socket = SocketObject::new_connected(resource, create_request, local_address);
-    let handle = reference.commit(ObjectEntry::Socket(accepted_socket))?;
+    let accepted_socket = SocketObject::new_connected(
+        resource,
+        create_request,
+        status,
+        local_address,
+        remote_address,
+    );
+    accepted_socket.sync_readiness();
+    let handle = reference
+        .commit_with_readiness(ObjectEntry::Socket(accepted_socket), Some(registration))?;
     Ok(SocketOutcome::Completed(AcceptedBrokerSocket {
         handle,
         local_address,
@@ -1029,6 +1284,12 @@ pub fn accept(
 }
 
 /// Sends TCP stream bytes without waiting for readiness.
+///
+/// A socket shut down for writing fails with `Shutdown` once any connection
+/// attempt has finished, and an unconnected socket fails with `NotConnected`.
+/// A temporarily full socket, or one whose connection attempt is still being
+/// started, fails with [`BrokerError::WouldBlock`], or with
+/// [`BrokerError::NonBlockingWouldBlock`] if the socket is non-blocking.
 pub fn send(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -1038,16 +1299,76 @@ pub fn send(
     if flags.has_unsupported_bits() || data.len() > MAX_SOCKET_TRANSFER_SIZE as usize {
         return Err(BrokerError::UnsupportedOperation);
     }
-    let length = data.len();
-    let (resource, create_request, resource_retired) =
-        socket_state(process, handle, ObjectRights::WRITE)?;
+    let object = process.authorized_object(handle, ObjectRights::WRITE)?;
+    let result = send_stream(&object, data, flags);
+    sync_readiness(&object);
+    result
+}
+
+fn send_stream(
+    object: &RwLock<ObjectEntry>,
+    data: Vec<u8>,
+    flags: SendFlags,
+) -> Result<SocketOutcome<usize>> {
+    let (create_request, write_shutdown, view, connect_in_flight, nonblocking) =
+        read_socket(object, |socket| {
+            (
+                socket.create_request,
+                socket.write_shutdown,
+                socket.view(),
+                socket.connect_in_flight,
+                socket.status.nonblocking(),
+            )
+        })?;
     if !is_tcp(create_request) {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
-    if resource_retired {
+    if write_shutdown {
+        // Wait for a connection attempt, and report its failure, before
+        // reporting a shutdown recorded while connecting.
+        if view == SocketConnectionStatus::Connecting {
+            refresh(object, false);
+            let connecting = read_socket(object, |socket| {
+                socket.view() == SocketConnectionStatus::Connecting && socket.errors.is_empty()
+            })?;
+            if connecting {
+                return Err(would_block_error(BrokerError::WouldBlock, nonblocking));
+            }
+        }
+        return Ok(SocketOutcome::Failed(SocketError::Shutdown));
+    }
+    if matches!(
+        view,
+        SocketConnectionStatus::Unconnected | SocketConnectionStatus::Failed(_)
+    ) {
         return Ok(SocketOutcome::Failed(SocketError::NotConnected));
     }
-    let outcome = resource.platform_socket.send(data, flags)?;
+    // The transport may not have started connecting yet.
+    if connect_in_flight {
+        return Err(would_block_error(BrokerError::WouldBlock, nonblocking));
+    }
+    let outcome = transport_send(object, data, flags)?;
+    if let SocketOutcome::Failed(_) = outcome {
+        refresh_after_failure(object);
+    }
+    Ok(outcome)
+}
+
+fn transport_send(
+    object: &RwLock<ObjectEntry>,
+    data: Vec<u8>,
+    flags: SendFlags,
+) -> Result<SocketOutcome<usize>> {
+    let length = data.len();
+    let state = socket_state(object)?;
+    if state.resource_retired {
+        return Ok(SocketOutcome::Failed(SocketError::NotConnected));
+    }
+    let outcome = state
+        .resource
+        .platform_socket
+        .send(data, flags)
+        .map_err(|error| would_block_error(error, state.nonblocking))?;
     if let SocketOutcome::Completed(sent) = outcome
         && (sent > length || (length != 0 && sent == 0))
     {
@@ -1058,10 +1379,14 @@ pub fn send(
 
 /// Sends one complete datagram without waiting for readiness.
 ///
-/// The first valid send with an explicit destination on an unbound datagram
-/// socket reserves and binds a guest-visible local endpoint before invoking
-/// the platform. A temporarily full socket returns
-/// [`BrokerError::WouldBlock`].
+/// A pending error fails the send and is consumed, and a socket shut down for
+/// writing fails with `Shutdown`. Without `destination`, an unconnected
+/// socket fails with `DestinationAddressRequired`. The first valid send with
+/// an explicit destination on an unbound datagram socket reserves and binds a
+/// guest-visible local endpoint before invoking the platform. A temporarily
+/// full socket fails with a pending error if there is one, and otherwise with
+/// [`BrokerError::WouldBlock`], or with [`BrokerError::NonBlockingWouldBlock`]
+/// if the socket is non-blocking.
 pub fn send_to(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -1072,15 +1397,72 @@ pub fn send_to(
     if flags.has_unsupported_bits() || data.len() > MAX_UDP_DATAGRAM_SIZE as usize {
         return Err(BrokerError::UnsupportedOperation);
     }
-    let length = data.len();
     let object = process.authorized_object(handle, ObjectRights::WRITE)?;
-    let create_request = {
-        let object = object.read();
-        let ObjectEntry::Socket(socket) = &*object else {
-            return Err(BrokerError::InvalidRights);
-        };
-        socket.create_request
-    };
+    let result = send_datagram(process, &object, data, flags, destination);
+    sync_readiness(&object);
+    result
+}
+
+fn send_datagram(
+    process: &BrokerProcess,
+    object: &RwLock<ObjectEntry>,
+    data: Vec<u8>,
+    flags: SendFlags,
+    destination: Option<SocketAddrV4>,
+) -> Result<SocketOutcome<usize>> {
+    if !read_socket(object, |socket| is_udp(socket.create_request))? {
+        return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
+    }
+    if let Some(error) = take_pending_error(object) {
+        return Ok(SocketOutcome::Failed(error));
+    }
+    let (write_shutdown, view) =
+        read_socket(object, |socket| (socket.write_shutdown, socket.view()))?;
+    if write_shutdown {
+        return Ok(SocketOutcome::Failed(SocketError::Shutdown));
+    }
+    if destination.is_none() && view != SocketConnectionStatus::Connected {
+        return Ok(SocketOutcome::Failed(
+            SocketError::DestinationAddressRequired,
+        ));
+    }
+    finish_datagram_transfer(
+        object,
+        transport_send_to(process, object, data, flags, destination),
+    )
+}
+
+/// Reports a datagram transfer's pending error in place of a would-block
+/// failure, and records any error that follows a failed transfer.
+fn finish_datagram_transfer<T>(
+    object: &RwLock<ObjectEntry>,
+    result: Result<SocketOutcome<T>>,
+) -> Result<SocketOutcome<T>> {
+    match result {
+        Err(error @ (BrokerError::WouldBlock | BrokerError::NonBlockingWouldBlock)) => {
+            match take_pending_error(object) {
+                Some(error) => Ok(SocketOutcome::Failed(error)),
+                None => Err(error),
+            }
+        }
+        Ok(SocketOutcome::Failed(error)) => {
+            refresh(object, true);
+            Ok(SocketOutcome::Failed(error))
+        }
+        result => result,
+    }
+}
+
+/// Sends one datagram, first binding an unbound socket.
+fn transport_send_to(
+    process: &BrokerProcess,
+    object: &RwLock<ObjectEntry>,
+    data: Vec<u8>,
+    flags: SendFlags,
+    destination: Option<SocketAddrV4>,
+) -> Result<SocketOutcome<usize>> {
+    let length = data.len();
+    let create_request = read_socket(object, |socket| socket.create_request)?;
     let destination = match destination {
         Some(destination) if destination.port() == 0 => {
             return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
@@ -1104,7 +1486,7 @@ pub fn send_to(
             Err(error) => return Err(error),
         }
     }
-    let (resource, needs_bind) = {
+    let (resource, needs_bind, nonblocking) = {
         let mut object = object.write();
         let ObjectEntry::Socket(socket) = &mut *object else {
             return Err(BrokerError::InvalidRights);
@@ -1125,24 +1507,28 @@ pub fn send_to(
             }
             socket.configuration_in_flight = true;
         }
-        (Arc::clone(&socket.resource), needs_bind)
+        (
+            Arc::clone(&socket.resource),
+            needs_bind,
+            socket.status.nonblocking(),
+        )
     };
     if needs_bind {
         match reserve_and_bind(process, create_request, &resource, DEFAULT_LOCAL_ADDRESS) {
             Ok(ReserveAndBindOutcome::Completed(local_address, port_binding)) => {
-                finish_configuration(&object, Some(local_address), Some(port_binding), false)?;
+                finish_configuration(object, Some(local_address), Some(port_binding), false)?;
             }
             Ok(ReserveAndBindOutcome::Failed(error)) => {
-                finish_configuration(&object, None, None, false)?;
+                finish_configuration(object, None, None, false)?;
                 return Ok(SocketOutcome::Failed(error));
             }
             Ok(ReserveAndBindOutcome::Retired(port_binding)) => {
-                finish_retired_configuration(&object, None, None)?;
+                finish_retired_configuration(object, None, None)?;
                 retire_before_releasing_binding(&resource, port_binding);
                 return Err(BrokerError::Internal);
             }
             Err(error) => {
-                finish_configuration(&object, None, None, false)?;
+                finish_configuration(object, None, None, false)?;
                 return Err(error);
             }
         }
@@ -1154,7 +1540,10 @@ pub fn send_to(
     }) {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
-    let outcome = resource.platform_socket.send_to(data, flags, destination)?;
+    let outcome = resource
+        .platform_socket
+        .send_to(data, flags, destination)
+        .map_err(|error| would_block_error(error, nonblocking))?;
     if let SocketOutcome::Completed(sent) = outcome
         && sent != length
     {
@@ -1164,6 +1553,14 @@ pub fn send_to(
 }
 
 /// Receives TCP stream bytes without waiting for readiness.
+///
+/// An unconnected socket fails with `NotConnected`, or with `Shutdown` if it
+/// was shut down for reading and has no pending error, and a failed
+/// connection reports end of stream. A socket shut down for reading fails
+/// with `Shutdown` instead of waiting. A temporarily empty socket, or one
+/// whose connection attempt is still being started, fails with
+/// [`BrokerError::WouldBlock`], or with [`BrokerError::NonBlockingWouldBlock`]
+/// if the socket is non-blocking.
 pub fn receive(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -1190,12 +1587,85 @@ pub fn receive(
     {
         return Err(BrokerError::UnsupportedOperation);
     }
-    let (resource, create_request, resource_retired) =
-        socket_state(process, handle, ObjectRights::WAIT)?;
+    let object = process.authorized_object(handle, ObjectRights::WAIT)?;
+    let result = receive_stream(&object, handle, length, flags, peek_offset, peek_length);
+    sync_readiness(&object);
+    result
+}
+
+fn receive_stream(
+    object: &RwLock<ObjectEntry>,
+    reader: ObjectHandle,
+    length: usize,
+    mut flags: ReceiveFlags,
+    peek_offset: u32,
+    peek_length: u32,
+) -> Result<SocketOutcome<PlatformStreamReceive>> {
+    let (create_request, read_shutdown, connect_in_flight, nonblocking, precheck) =
+        read_socket(object, |socket| {
+            let precheck = match socket.view() {
+                // A listener ignores shutdowns, and a pending error is reported
+                // before a shutdown.
+                SocketConnectionStatus::Unconnected
+                    if socket.read_shutdown && !socket.listening && socket.errors.is_empty() =>
+                {
+                    Some(SocketOutcome::Failed(SocketError::Shutdown))
+                }
+                SocketConnectionStatus::Unconnected => {
+                    Some(SocketOutcome::Failed(SocketError::NotConnected))
+                }
+                SocketConnectionStatus::Failed(_) => {
+                    Some(SocketOutcome::Completed(PlatformStreamReceive::EndOfStream))
+                }
+                _ => None,
+            };
+            (
+                socket.create_request,
+                socket.read_shutdown,
+                socket.connect_in_flight,
+                socket.status.nonblocking(),
+                precheck,
+            )
+        })?;
     if !is_tcp(create_request) {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
-    if resource_retired {
+    if let Some(outcome) = precheck {
+        return Ok(outcome);
+    }
+    // The transport does not know about a shutdown recorded before the
+    // connection, so it must not wait for more data than is queued.
+    if read_shutdown {
+        flags = ReceiveFlags(flags.0 & !ReceiveFlags::WAITALL.0);
+    }
+    // The transport may not have started connecting yet.
+    let result = if connect_in_flight && length != 0 {
+        Err(would_block_error(BrokerError::WouldBlock, nonblocking))
+    } else {
+        transport_receive(object, reader, length, flags, peek_offset, peek_length)
+    };
+    match result {
+        Err(BrokerError::WouldBlock | BrokerError::NonBlockingWouldBlock) if read_shutdown => {
+            Ok(SocketOutcome::Failed(SocketError::Shutdown))
+        }
+        Ok(SocketOutcome::Failed(error)) => {
+            refresh_after_failure(object);
+            Ok(SocketOutcome::Failed(error))
+        }
+        result => result,
+    }
+}
+
+fn transport_receive(
+    object: &RwLock<ObjectEntry>,
+    reader: ObjectHandle,
+    length: usize,
+    flags: ReceiveFlags,
+    peek_offset: u32,
+    peek_length: u32,
+) -> Result<SocketOutcome<PlatformStreamReceive>> {
+    let state = socket_state(object)?;
+    if state.resource_retired {
         return Ok(SocketOutcome::Failed(SocketError::NotConnected));
     }
     if length == 0 {
@@ -1203,9 +1673,11 @@ pub fn receive(
             Vec::new(),
         )));
     }
-    let outcome = resource
+    let outcome = state
+        .resource
         .platform_socket
-        .receive(length, flags, peek_offset, peek_length)?;
+        .receive(reader, length, flags, peek_offset, peek_length)
+        .map_err(|error| would_block_error(error, state.nonblocking))?;
     if let SocketOutcome::Completed(PlatformStreamReceive::Received(received)) = &outcome
         && (received.len() > length || received.is_empty())
     {
@@ -1216,7 +1688,11 @@ pub fn receive(
 
 /// Receives one datagram without waiting for readiness.
 ///
-/// When no datagram is available, returns [`BrokerError::WouldBlock`].
+/// A pending error fails the receive and is consumed, and a socket shut down
+/// for reading fails with `Shutdown`. When no datagram is available, fails
+/// with a pending error if there is one, and otherwise with
+/// [`BrokerError::WouldBlock`], or with [`BrokerError::NonBlockingWouldBlock`]
+/// if the socket is non-blocking.
 pub fn receive_from(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -1226,15 +1702,50 @@ pub fn receive_from(
     if flags.has_unsupported_bits() || length > MAX_UDP_DATAGRAM_SIZE as usize {
         return Err(BrokerError::UnsupportedOperation);
     }
-    let (resource, create_request, resource_retired) =
-        socket_state(process, handle, ObjectRights::WAIT)?;
-    if !is_udp(create_request) {
+    let object = process.authorized_object(handle, ObjectRights::WAIT)?;
+    let result = receive_datagram(&object, length, flags);
+    sync_readiness(&object);
+    result
+}
+
+fn receive_datagram(
+    object: &RwLock<ObjectEntry>,
+    length: usize,
+    flags: ReceiveFromFlags,
+) -> Result<SocketOutcome<PlatformDatagramReceive>> {
+    if !read_socket(object, |socket| is_udp(socket.create_request))? {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
-    if resource_retired {
+    if let Some(error) = take_pending_error(object) {
+        return Ok(SocketOutcome::Failed(error));
+    }
+    if read_socket(object, |socket| socket.read_shutdown)? {
+        return Ok(SocketOutcome::Failed(SocketError::Shutdown));
+    }
+    match transport_receive_from(object, length, flags) {
+        Ok(SocketOutcome::Failed(SocketError::NotConnected))
+            if read_socket(object, |socket| socket.read_shutdown)? =>
+        {
+            Ok(SocketOutcome::Failed(SocketError::Shutdown))
+        }
+        result => finish_datagram_transfer(object, result),
+    }
+}
+
+fn transport_receive_from(
+    object: &RwLock<ObjectEntry>,
+    length: usize,
+    flags: ReceiveFromFlags,
+) -> Result<SocketOutcome<PlatformDatagramReceive>> {
+    let state = socket_state(object)?;
+    if state.resource_retired {
         return Ok(SocketOutcome::Failed(SocketError::NotConnected));
     }
-    let outcome = resource.platform_socket.receive_from(length, flags)?;
+    let outcome = state
+        .resource
+        .platform_socket
+        .receive_from(length, flags)
+        .map_err(|error| would_block_error(error, state.nonblocking))?;
     if let SocketOutcome::Completed(received) = &outcome
         && (received.data.len() != received.datagram_length.min(length)
             || received.datagram_length > MAX_UDP_DATAGRAM_SIZE as usize
@@ -1245,60 +1756,182 @@ pub fn receive_from(
     Ok(outcome)
 }
 
-/// Sets a typed option on a broker-owned TCP socket.
-pub fn set_tcp_option(
+/// Sets one option of a broker-owned socket.
+///
+/// The transport implements a TCP socket's `NoDelay` and `KeepAlive`; the
+/// broker stores the other options, and fails with `UnsupportedOperation` for
+/// `NoDelay` on a datagram socket.
+pub fn set_option(
     process: &BrokerProcess,
     handle: ObjectHandle,
-    value: TcpOptionValue,
+    value: SocketOptionValue,
 ) -> Result<()> {
-    let (resource, create_request, resource_retired) =
-        socket_state(process, handle, ObjectRights::WRITE)?;
-    if !is_tcp(create_request) {
-        return Err(BrokerError::UnsupportedOperation);
+    let object = process.authorized_object(handle, ObjectRights::WRITE)?;
+    let mut object = object.write();
+    let ObjectEntry::Socket(socket) = &mut *object else {
+        return Err(BrokerError::InvalidRights);
+    };
+    if !is_tcp_option(socket.create_request, value.name()) {
+        return socket.options.set(value);
     }
-    if resource_retired {
+    if socket.resource_retired {
         return Err(BrokerError::Internal);
     }
+    let resource = Arc::clone(&socket.resource);
+    drop(object);
     resource.platform_socket.set_tcp_option(value)
 }
 
-/// Reads a typed option from a broker-owned TCP socket.
-pub fn get_tcp_option(
+/// Returns one option of a broker-owned socket.
+pub fn get_option(
     process: &BrokerProcess,
     handle: ObjectHandle,
-    name: TcpOptionName,
-) -> Result<TcpOptionValue> {
-    let (resource, create_request, resource_retired) =
-        socket_state(process, handle, ObjectRights::WAIT)?;
-    if !is_tcp(create_request) {
-        return Err(BrokerError::UnsupportedOperation);
+    name: SocketOptionName,
+) -> Result<SocketOptionValue> {
+    let object = process
+        .authorized_object_with_any_rights(handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
+    let object = object.read();
+    let ObjectEntry::Socket(socket) = &*object else {
+        return Err(BrokerError::InvalidRights);
+    };
+    if !is_tcp_option(socket.create_request, name) {
+        return socket.options.get(name);
     }
-    if resource_retired {
+    if socket.resource_retired {
         return Err(BrokerError::Internal);
     }
+    let resource = Arc::clone(&socket.resource);
+    drop(object);
     let value = resource.platform_socket.get_tcp_option(name)?;
-    if !matches!(
-        (name, value),
-        (TcpOptionName::NoDelay, TcpOptionValue::NoDelay(_))
-            | (TcpOptionName::KeepAlive, TcpOptionValue::KeepAlive(_))
-    ) {
+    if value.name() != name {
         return Err(BrokerError::Internal);
     }
     Ok(value)
 }
 
+/// Returns whether the transport of a socket created by `create_request`
+/// implements the option `name`.
+fn is_tcp_option(create_request: CreateSocketRequest, name: SocketOptionName) -> bool {
+    is_tcp(create_request)
+        && matches!(
+            name,
+            SocketOptionName::NoDelay | SocketOptionName::KeepAlive
+        )
+}
+
+/// Returns `error`, reporting [`BrokerError::WouldBlock`] as
+/// [`BrokerError::NonBlockingWouldBlock`] for a non-blocking socket.
+fn would_block_error(error: BrokerError, nonblocking: bool) -> BrokerError {
+    match error {
+        BrokerError::WouldBlock if nonblocking => BrokerError::NonBlockingWouldBlock,
+        error => error,
+    }
+}
+
 /// Applies a directional or TCP lifecycle shutdown mode.
 ///
-/// Read, write, and both apply to TCP and UDP but return `NotConnected` for a
-/// TCP listener. Abort and stop-listening are TCP-only. Stopping an active
-/// listener with `Completed` or `Failed(NotConnected)` transitions it to
-/// `Failed(NotConnected)`.
+/// Read, write, and both apply to TCP and UDP and are recorded even when the
+/// socket is unconnected, which fails with `NotConnected`; they fail with
+/// `Listening` for a TCP listener. Shutting down a connecting TCP socket may
+/// abort its attempt, leaving it unconnected with the attempt's error
+/// pending. Abort and stop-listening are TCP-only. Stopping a listener leaves
+/// it unconnected, and stopping any other socket fails with `NotConnected`.
 pub fn shutdown(
     process: &BrokerProcess,
     handle: ObjectHandle,
     mode: ShutdownMode,
 ) -> Result<SocketOutcome<()>> {
     let object = process.authorized_object(handle, ObjectRights::WRITE)?;
+    let result = if read_socket(&object, |socket| is_udp(socket.create_request))? {
+        shutdown_datagram(&object, mode)
+    } else {
+        shutdown_stream(&object, mode)
+    };
+    sync_readiness(&object);
+    result
+}
+
+fn shutdown_stream(object: &RwLock<ObjectEntry>, mode: ShutdownMode) -> Result<SocketOutcome<()>> {
+    let (listening, view) = read_socket(object, |socket| (socket.listening, socket.view()))?;
+    match mode {
+        ShutdownMode::StopListening => {
+            if !listening {
+                return Ok(SocketOutcome::Failed(SocketError::NotConnected));
+            }
+            let outcome = transport_shutdown(object, mode)?;
+            write_socket(object, |socket| {
+                // A stopped listener returns to the unconnected state.
+                if !socket.listening {
+                    socket.reset_connection();
+                }
+            })?;
+            Ok(outcome)
+        }
+        ShutdownMode::Read | ShutdownMode::Write | ShutdownMode::Both => {
+            if listening {
+                return Ok(SocketOutcome::Failed(SocketError::Listening));
+            }
+            match transport_shutdown(object, mode)? {
+                SocketOutcome::Completed(()) => {
+                    let aborted = view == SocketConnectionStatus::Connecting
+                        && matches!(
+                            transport_status(object, true),
+                            Ok((
+                                PlatformSocketStatus {
+                                    status: SocketConnectionStatus::Failed(_),
+                                    ..
+                                },
+                                _
+                            ))
+                        );
+                    write_socket(object, |socket| {
+                        if aborted {
+                            socket.reset_connection();
+                        } else {
+                            socket.record_shutdown(mode);
+                        }
+                    })?;
+                    Ok(SocketOutcome::Completed(()))
+                }
+                SocketOutcome::Failed(SocketError::NotConnected) => {
+                    // An unconnected socket records the shutdown even though
+                    // the call fails.
+                    write_socket(object, |socket| socket.record_shutdown(mode))?;
+                    Ok(SocketOutcome::Failed(SocketError::NotConnected))
+                }
+                outcome @ SocketOutcome::Failed(_) => Ok(outcome),
+            }
+        }
+        _ => transport_shutdown(object, mode),
+    }
+}
+
+fn shutdown_datagram(
+    object: &RwLock<ObjectEntry>,
+    mode: ShutdownMode,
+) -> Result<SocketOutcome<()>> {
+    let view = read_socket(object, SocketObject::view)?;
+    let outcome = transport_shutdown(object, mode)?;
+    let SocketOutcome::Completed(()) = outcome else {
+        return Ok(outcome);
+    };
+    write_socket(object, |socket| socket.record_shutdown(mode))?;
+    Ok(if view == SocketConnectionStatus::Connected {
+        SocketOutcome::Completed(())
+    } else {
+        SocketOutcome::Failed(SocketError::NotConnected)
+    })
+}
+
+/// Applies a shutdown mode to the transport.
+///
+/// Read, write, and both return `NotConnected` for a TCP listener. Abort and
+/// stop-listening are TCP-only. Stopping an active listener with `Completed`
+/// or `Failed(NotConnected)` transitions it to `Failed(NotConnected)`.
+fn transport_shutdown(
+    object: &RwLock<ObjectEntry>,
+    mode: ShutdownMode,
+) -> Result<SocketOutcome<()>> {
     let (resource, serializes_configuration, shuts_down_listener) = {
         let mut object = object.write();
         let ObjectEntry::Socket(socket) = &mut *object else {
@@ -1349,32 +1982,46 @@ pub fn shutdown(
     outcome
 }
 
-/// Returns broker-authoritative socket state and consumes at most one pending
-/// asynchronous error.
+/// Returns a socket's broker-authoritative transport state, consuming at
+/// most one pending platform error, and whether this call found an error.
 ///
-/// Stream queries reconcile asynchronous connection completion. Datagram
-/// queries preserve broker-owned peer state while consuming platform errors,
-/// refining the local address, and validating the snapshot. A platform report
-/// that contradicts broker-owned state retires the socket, latches
-/// `Failed(Other)`, and returns [`BrokerError::Internal`].
-pub fn status(process: &BrokerProcess, handle: ObjectHandle) -> Result<SocketStatusResponse> {
-    let object = process.authorized_object(handle, ObjectRights::WAIT)?;
-    let datagram = {
-        let object = object.read();
-        let ObjectEntry::Socket(socket) = &*object else {
-            return Err(BrokerError::InvalidRights);
-        };
-        is_udp(socket.create_request)
-    };
-
-    if datagram {
-        datagram_status(&object)
+/// With `queue_errors`, a found error is queued on the socket, and such
+/// queries of one socket run one at a time. Stream queries
+/// reconcile asynchronous connection completion, and a connection failure
+/// they observe is a found error. Datagram queries preserve broker-owned peer
+/// state while consuming platform errors, refining the local address, and
+/// validating the snapshot. A platform report that contradicts broker-owned
+/// state retires the socket, latches `Failed(Other)`, and returns
+/// [`BrokerError::Internal`].
+fn transport_status(
+    object: &RwLock<ObjectEntry>,
+    queue_errors: bool,
+) -> Result<(PlatformSocketStatus, bool)> {
+    let (resource, udp) = read_socket(object, |socket| {
+        (Arc::clone(&socket.resource), is_udp(socket.create_request))
+    })?;
+    let _error_queries = queue_errors.then(|| resource.error_queries.lock());
+    if udp {
+        datagram_status(object, queue_errors)
     } else {
-        stream_status(&object)
+        stream_status(object, queue_errors)
     }
 }
 
-fn stream_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusResponse> {
+/// Returns a socket's transport state, consuming at most one pending platform
+/// error without queuing it.
+#[cfg(any(test, feature = "test-support"))]
+pub fn status(process: &BrokerProcess, handle: ObjectHandle) -> Result<PlatformSocketStatus> {
+    let object = process.authorized_object(handle, ObjectRights::WAIT)?;
+    let result = transport_status(&object, false).map(|(status, _)| status);
+    sync_readiness(&object);
+    result
+}
+
+fn stream_status(
+    object: &RwLock<ObjectEntry>,
+    queue_errors: bool,
+) -> Result<(PlatformSocketStatus, bool)> {
     let (resource, status, local_address, connect_in_flight) = {
         let object = object.read();
         let ObjectEntry::Socket(socket) = &*object else {
@@ -1388,21 +2035,27 @@ fn stream_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRespo
         )
     };
     if connect_in_flight {
-        return Ok(SocketStatusResponse {
-            status: SocketConnectionStatus::Connecting,
-            local_address,
-            pending_error: None,
-        });
+        return Ok((
+            PlatformSocketStatus {
+                status: SocketConnectionStatus::Connecting,
+                local_address,
+                pending_error: None,
+            },
+            false,
+        ));
     }
     if matches!(
         status,
         SocketConnectionStatus::Unconnected | SocketConnectionStatus::Failed(_)
     ) {
-        return Ok(SocketStatusResponse {
-            status,
-            local_address,
-            pending_error: None,
-        });
+        return Ok((
+            PlatformSocketStatus {
+                status,
+                local_address,
+                pending_error: None,
+            },
+            false,
+        ));
     }
 
     let platform_status = match resource.platform_socket.status() {
@@ -1413,11 +2066,14 @@ fn stream_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRespo
                 return Err(BrokerError::InvalidRights);
             };
             if socket.resource_retired {
-                return Ok(SocketStatusResponse {
-                    status: socket.connection_status,
-                    local_address: socket.local_address,
-                    pending_error: None,
-                });
+                return Ok((
+                    PlatformSocketStatus {
+                        status: socket.connection_status,
+                        local_address: socket.local_address,
+                        pending_error: None,
+                    },
+                    false,
+                ));
             }
             return Err(error);
         }
@@ -1427,11 +2083,14 @@ fn stream_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRespo
         return Err(BrokerError::InvalidRights);
     };
     if socket.resource_retired {
-        return Ok(SocketStatusResponse {
-            status: socket.connection_status,
-            local_address: socket.local_address,
-            pending_error: None,
-        });
+        return Ok((
+            PlatformSocketStatus {
+                status: socket.connection_status,
+                local_address: socket.local_address,
+                pending_error: None,
+            },
+            false,
+        ));
     }
     let Some(broker_local_address) = socket.local_address else {
         socket.listening = false;
@@ -1464,19 +2123,32 @@ fn stream_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRespo
         resource.retire();
         return Err(BrokerError::Internal);
     }
+    let mut found = platform_status.pending_error.map(QueuedSocketError::Other);
     // Do not overwrite a concurrent terminal transition.
     if socket.connection_status == SocketConnectionStatus::Connecting {
         socket.connection_status = platform_status.status;
+        if let SocketConnectionStatus::Failed(error) = platform_status.status {
+            found = found.or(Some(QueuedSocketError::ConnectionFailure(error)));
+        }
     }
-    Ok(SocketStatusResponse {
-        status: socket.connection_status,
-        local_address: socket.local_address,
-        pending_error: platform_status.pending_error,
-    })
+    if queue_errors && let Some(error) = found {
+        socket.errors.append(error);
+    }
+    Ok((
+        PlatformSocketStatus {
+            status: socket.connection_status,
+            local_address: socket.local_address,
+            pending_error: platform_status.pending_error,
+        },
+        found.is_some(),
+    ))
 }
 
 /// Retries once if a concurrent datagram connect replaces the peer mid-query.
-fn datagram_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusResponse> {
+fn datagram_status(
+    object: &RwLock<ObjectEntry>,
+    queue_errors: bool,
+) -> Result<(PlatformSocketStatus, bool)> {
     let (
         resource,
         status,
@@ -1501,11 +2173,14 @@ fn datagram_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRes
         )
     };
     if configuration_in_flight || resource_retired {
-        return Ok(SocketStatusResponse {
-            status,
-            local_address,
-            pending_error: None,
-        });
+        return Ok((
+            PlatformSocketStatus {
+                status,
+                local_address,
+                pending_error: None,
+            },
+            false,
+        ));
     }
     let mut expected_datagram_generation = datagram_connect_generation;
     let mut retried_datagram_status = false;
@@ -1523,11 +2198,14 @@ fn datagram_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRes
             )
         };
         if resource_retired {
-            return Ok(SocketStatusResponse {
-                status,
-                local_address,
-                pending_error: None,
-            });
+            return Ok((
+                PlatformSocketStatus {
+                    status,
+                    local_address,
+                    pending_error: None,
+                },
+                false,
+            ));
         }
         let platform_status = match resource.platform_socket.status() {
             Ok(status) => status,
@@ -1537,11 +2215,14 @@ fn datagram_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRes
                     return Err(BrokerError::InvalidRights);
                 };
                 if socket.resource_retired {
-                    return Ok(SocketStatusResponse {
-                        status: socket.connection_status,
-                        local_address: socket.local_address,
-                        pending_error: None,
-                    });
+                    return Ok((
+                        PlatformSocketStatus {
+                            status: socket.connection_status,
+                            local_address: socket.local_address,
+                            pending_error: None,
+                        },
+                        false,
+                    ));
                 }
                 return Err(error);
             }
@@ -1552,18 +2233,29 @@ fn datagram_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRes
             return Err(BrokerError::InvalidRights);
         };
         if socket.resource_retired {
-            return Ok(SocketStatusResponse {
-                status: socket.connection_status,
-                local_address: socket.local_address,
-                pending_error: None,
-            });
+            return Ok((
+                PlatformSocketStatus {
+                    status: socket.connection_status,
+                    local_address: socket.local_address,
+                    pending_error: None,
+                },
+                false,
+            ));
+        }
+        // A retry follows only an iteration without an error, so this queues
+        // each consumed error once.
+        if queue_errors && let Some(error) = platform_status.pending_error {
+            socket.errors.append(QueuedSocketError::Other(error));
         }
         if socket.configuration_in_flight {
-            return Ok(SocketStatusResponse {
-                status: socket.connection_status,
-                local_address: socket.local_address,
-                pending_error,
-            });
+            return Ok((
+                PlatformSocketStatus {
+                    status: socket.connection_status,
+                    local_address: socket.local_address,
+                    pending_error,
+                },
+                pending_error.is_some(),
+            ));
         }
         let invalid_local_address = match (socket.local_address, platform_status.local_address) {
             (None, Some(_)) => true,
@@ -1599,11 +2291,14 @@ fn datagram_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRes
             // A retry after consuming an error could consume another; after
             // one retry, return broker state rather than apply an unordered
             // snapshot.
-            return Ok(SocketStatusResponse {
-                status: socket.connection_status,
-                local_address: socket.local_address,
-                pending_error,
-            });
+            return Ok((
+                PlatformSocketStatus {
+                    status: socket.connection_status,
+                    local_address: socket.local_address,
+                    pending_error,
+                },
+                pending_error.is_some(),
+            ));
         }
         let local_address_refinement = match (socket.local_address, platform_status.local_address) {
             (Some(broker_address), Some(observed))
@@ -1614,11 +2309,14 @@ fn datagram_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRes
             _ => None,
         };
         socket.local_address = local_address_refinement.or(socket.local_address);
-        return Ok(SocketStatusResponse {
-            status: socket.connection_status,
-            local_address: socket.local_address,
-            pending_error,
-        });
+        return Ok((
+            PlatformSocketStatus {
+                status: socket.connection_status,
+                local_address: socket.local_address,
+                pending_error,
+            },
+            pending_error.is_some(),
+        ));
     }
 }
 
@@ -1636,21 +2334,129 @@ fn socket_resource(
     Ok(Arc::clone(&socket.resource))
 }
 
-fn socket_state(
-    process: &BrokerProcess,
-    handle: ObjectHandle,
-    required_rights: ObjectRights,
-) -> Result<(Arc<SocketResource>, CreateSocketRequest, bool)> {
-    let object = process.authorized_object(handle, required_rights)?;
+/// A snapshot of the state of a socket that an operation needs after
+/// releasing the object lock.
+struct SocketState {
+    resource: Arc<SocketResource>,
+    resource_retired: bool,
+    nonblocking: bool,
+}
+
+fn socket_state(object: &RwLock<ObjectEntry>) -> Result<SocketState> {
+    read_socket(object, |socket| SocketState {
+        resource: Arc::clone(&socket.resource),
+        resource_retired: socket.resource_retired,
+        nonblocking: socket.status.nonblocking(),
+    })
+}
+
+/// Returns `f` applied to the socket `object`.
+fn read_socket<T>(object: &RwLock<ObjectEntry>, f: impl FnOnce(&SocketObject) -> T) -> Result<T> {
     let object = object.read();
     let ObjectEntry::Socket(socket) = &*object else {
         return Err(BrokerError::InvalidRights);
     };
-    Ok((
-        Arc::clone(&socket.resource),
-        socket.create_request,
-        socket.resource_retired,
-    ))
+    Ok(f(socket))
+}
+
+/// Returns `f` applied to the socket `object`, which it may change.
+fn write_socket<T>(
+    object: &RwLock<ObjectEntry>,
+    f: impl FnOnce(&mut SocketObject) -> T,
+) -> Result<T> {
+    let mut object = object.write();
+    let ObjectEntry::Socket(socket) = &mut *object else {
+        return Err(BrokerError::InvalidRights);
+    };
+    Ok(f(socket))
+}
+
+/// Publishes the readiness of `object`, if it is a socket, after a change to
+/// its state.
+///
+/// This holds the object lock so that publications follow state changes in
+/// order.
+fn sync_readiness(object: &RwLock<ObjectEntry>) {
+    if let ObjectEntry::Socket(socket) = &*object.read() {
+        socket.sync_readiness();
+    }
+}
+
+/// Queues the transport's pending error if the socket has no queued error
+/// and its transport may have one: a datagram socket, or a stream that is
+/// connecting or, with `include_connected`, connected.
+fn refresh(object: &RwLock<ObjectEntry>, include_connected: bool) {
+    let needed = read_socket(object, |socket| {
+        socket.errors.is_empty()
+            && (is_udp(socket.create_request)
+                || match socket.view() {
+                    SocketConnectionStatus::Connecting => true,
+                    SocketConnectionStatus::Connected => include_connected,
+                    _ => false,
+                })
+    });
+    if matches!(needed, Ok(true)) && transport_status(object, true).is_err() {
+        let _ = write_socket(object, |socket| socket.errors.prepend(SocketError::Other));
+    }
+}
+
+/// Queues the errors that follow a failed stream transfer, draining both of
+/// the transport's error slots, and discards a queued connection failure,
+/// which the transfer reported.
+fn refresh_after_failure(object: &RwLock<ObjectEntry>) {
+    for _ in 0..2 {
+        if !matches!(
+            read_socket(object, SocketObject::view),
+            Ok(SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected)
+        ) {
+            break;
+        }
+        match transport_status(object, true) {
+            Ok((_, true)) => {}
+            Ok((_, false)) => break,
+            Err(_) => {
+                let _ = write_socket(object, |socket| {
+                    socket
+                        .errors
+                        .append(QueuedSocketError::Other(SocketError::Other));
+                });
+                break;
+            }
+        }
+    }
+    let _ = write_socket(object, |socket| socket.errors.take_connection_failure());
+}
+
+/// Takes a socket's oldest pending error, and then queues the transport's
+/// next one if that emptied the queue.
+fn take_pending_error(object: &RwLock<ObjectEntry>) -> Option<SocketError> {
+    let (error, empty) = write_socket(object, |socket| {
+        let error = socket.errors.take();
+        (error, socket.errors.is_empty())
+    })
+    .ok()?;
+    if error.is_some() && empty {
+        refresh(object, true);
+    }
+    error
+}
+
+/// Brings a socket's readiness up to date before it is reported, queuing a
+/// pending transport error and observing a connection attempt's progress.
+pub(crate) fn refresh_readiness(object: &RwLock<ObjectEntry>) {
+    let Ok((resource, udp)) = read_socket(object, |socket| {
+        (Arc::clone(&socket.resource), is_udp(socket.create_request))
+    }) else {
+        return;
+    };
+    let error = resource
+        .platform_socket
+        .readiness()
+        .contains(ReadinessFlags::ERROR);
+    if !udp || error {
+        refresh(object, error);
+    }
+    sync_readiness(object);
 }
 
 enum ReserveAndBindOutcome {
@@ -1688,7 +2494,7 @@ fn retire_before_releasing_binding(resource: &SocketResource, port_binding: Arc<
     drop(port_binding);
 }
 
-fn connect_datagram(
+fn transport_connect_datagram(
     process: &BrokerProcess,
     object: &spin::RwLock<ObjectEntry>,
     create_request: CreateSocketRequest,
@@ -1717,7 +2523,7 @@ fn connect_datagram(
             match reserve_and_bind(process, create_request, &resource, DEFAULT_LOCAL_ADDRESS) {
                 Ok(binding) => binding,
                 Err(error) => {
-                    finish_datagram_connect(object, previous_status, false);
+                    finish_datagram_connect(object, previous_status, None);
                     return Err(error);
                 }
             };
@@ -1726,7 +2532,7 @@ fn connect_datagram(
                 attach_datagram_binding(object, local_address, port_binding)?;
             }
             ReserveAndBindOutcome::Failed(error) => {
-                finish_datagram_connect(object, previous_status, false);
+                finish_datagram_connect(object, previous_status, None);
                 return Ok(SocketOutcome::Failed(error));
             }
             ReserveAndBindOutcome::Retired(port_binding) => {
@@ -1740,16 +2546,16 @@ fn connect_datagram(
         .source_address_for_destination(destination)
         .is_none()
     {
-        finish_datagram_connect(object, previous_status, false);
+        finish_datagram_connect(object, previous_status, None);
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
     match resource.platform_socket.connect(destination, None) {
         Ok(SocketConnectionStatus::Connected) => {
-            finish_datagram_connect(object, SocketConnectionStatus::Connected, true);
+            finish_datagram_connect(object, SocketConnectionStatus::Connected, Some(destination));
             Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
         }
         Ok(SocketConnectionStatus::Failed(error)) => {
-            finish_datagram_connect(object, previous_status, false);
+            finish_datagram_connect(object, previous_status, None);
             Ok(SocketOutcome::Failed(error))
         }
         Ok(_) => {
@@ -1758,7 +2564,7 @@ fn connect_datagram(
             Err(BrokerError::Internal)
         }
         Err(PlatformConnectError::PeerUnchanged(error)) => {
-            finish_datagram_connect(object, previous_status, false);
+            finish_datagram_connect(object, previous_status, None);
             Err(error)
         }
         Err(PlatformConnectError::PeerIndeterminate(error)) => {
@@ -1803,13 +2609,14 @@ fn attach_datagram_binding(
 fn finish_datagram_connect(
     object: &spin::RwLock<ObjectEntry>,
     status: SocketConnectionStatus,
-    peer_state_changed: bool,
+    peer: Option<SocketAddrV4>,
 ) {
     let mut object = object.write();
     if let ObjectEntry::Socket(socket) = &mut *object {
         socket.configuration_in_flight = false;
         socket.connection_status = status;
-        if peer_state_changed {
+        if peer.is_some() {
+            socket.peer_address = peer;
             // This distinguishes status snapshots from before a successful
             // peer replacement. A status call cannot overlap enough connects
             // for wrapping to make a stale snapshot appear current.
@@ -1827,11 +2634,20 @@ fn finish_retired_datagram_connect(object: &spin::RwLock<ObjectEntry>) {
     }
 }
 
-fn finish_connect(object: &spin::RwLock<ObjectEntry>, status: SocketConnectionStatus) {
+/// Abandons a claimed stream connection attempt that had no effect, leaving
+/// the stream unconnected.
+///
+/// The stream returns to its readiness before the claim, so this republishes
+/// that readiness to wake waiters that saw the attempt in progress.
+fn abandon_connect(object: &spin::RwLock<ObjectEntry>) {
     let mut object = object.write();
     if let ObjectEntry::Socket(socket) = &mut *object {
         socket.connect_in_flight = false;
-        socket.connection_status = status;
+        socket.connection_status = SocketConnectionStatus::Unconnected;
+        socket
+            .resource
+            .readiness_sink
+            .set_overlay(socket.readiness_overlay(), true);
     }
 }
 
@@ -1944,6 +2760,51 @@ fn finish_retired_configuration(
     Ok(())
 }
 
+/// Options a socket stores without its transport implementing them, which
+/// every reference to the socket shares.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SocketOptions {
+    receive_timeout: Option<Duration>,
+    send_timeout: Option<Duration>,
+    linger: Option<Duration>,
+    reuse_address: bool,
+    keep_alive: bool,
+    broadcast: bool,
+}
+
+impl SocketOptions {
+    /// Stores `value`, failing with `UnsupportedOperation` for
+    /// [`SocketOptionValue::NoDelay`], which only a TCP transport implements.
+    pub(crate) fn set(&mut self, value: SocketOptionValue) -> Result<()> {
+        match value {
+            SocketOptionValue::ReceiveTimeout(timeout) => self.receive_timeout = timeout,
+            SocketOptionValue::SendTimeout(timeout) => self.send_timeout = timeout,
+            SocketOptionValue::Linger(timeout) => self.linger = timeout,
+            SocketOptionValue::ReuseAddress(value) => self.reuse_address = value,
+            SocketOptionValue::KeepAlive(value) => self.keep_alive = value,
+            SocketOptionValue::Broadcast(value) => self.broadcast = value,
+            SocketOptionValue::NoDelay(_) => return Err(BrokerError::UnsupportedOperation),
+        }
+        Ok(())
+    }
+
+    /// Returns the stored value of the option `name`, failing with
+    /// `UnsupportedOperation` for [`SocketOptionName::NoDelay`].
+    pub(crate) fn get(&self, name: SocketOptionName) -> Result<SocketOptionValue> {
+        Ok(match name {
+            SocketOptionName::ReceiveTimeout => {
+                SocketOptionValue::ReceiveTimeout(self.receive_timeout)
+            }
+            SocketOptionName::SendTimeout => SocketOptionValue::SendTimeout(self.send_timeout),
+            SocketOptionName::Linger => SocketOptionValue::Linger(self.linger),
+            SocketOptionName::ReuseAddress => SocketOptionValue::ReuseAddress(self.reuse_address),
+            SocketOptionName::KeepAlive => SocketOptionValue::KeepAlive(self.keep_alive),
+            SocketOptionName::Broadcast => SocketOptionValue::Broadcast(self.broadcast),
+            SocketOptionName::NoDelay => return Err(BrokerError::UnsupportedOperation),
+        })
+    }
+}
+
 #[expect(
     clippy::struct_excessive_bools,
     reason = "socket lifecycle latches are independent"
@@ -1951,60 +2812,191 @@ fn finish_retired_configuration(
 pub(crate) struct SocketObject {
     resource: Arc<SocketResource>,
     create_request: CreateSocketRequest,
+    status: StatusFlags,
+    /// Options other than those [`is_tcp_option`] selects.
+    options: SocketOptions,
+    /// The transport's connection state, which [`Self::view`] refines.
     connection_status: SocketConnectionStatus,
     local_address: Option<SocketAddrV4>,
+    /// The peer of the latest successful connection attempt.
+    peer_address: Option<SocketAddrV4>,
     connect_in_flight: bool,
     configuration_in_flight: bool,
     listening: bool,
     datagram_connect_generation: u64,
     resource_retired: bool,
+    errors: SocketErrorQueue,
+    /// Whether a stream reported its connection, so that connecting again
+    /// fails with `AlreadyConnected`.
+    connect_reported: bool,
+    read_shutdown: bool,
+    write_shutdown: bool,
+    /// Whether a stream returned to the unconnected state after its
+    /// transport stopped listening or failed, which the transport cannot.
+    disconnected: bool,
 }
 
 impl SocketObject {
-    fn new(resource: Arc<SocketResource>, create_request: CreateSocketRequest) -> Self {
+    fn new(
+        resource: Arc<SocketResource>,
+        create_request: CreateSocketRequest,
+        status: StatusFlags,
+    ) -> Self {
         Self {
             resource,
             create_request,
+            status,
+            options: SocketOptions::default(),
             connection_status: SocketConnectionStatus::Unconnected,
             local_address: None,
+            peer_address: None,
             connect_in_flight: false,
             configuration_in_flight: false,
             listening: false,
             datagram_connect_generation: 0,
             resource_retired: false,
+            errors: SocketErrorQueue::default(),
+            connect_reported: false,
+            read_shutdown: false,
+            write_shutdown: false,
+            disconnected: false,
         }
     }
 
     fn new_connected(
         resource: Arc<SocketResource>,
         create_request: CreateSocketRequest,
+        status: StatusFlags,
         local_address: SocketAddrV4,
+        remote_address: SocketAddrV4,
     ) -> Self {
-        let mut socket = Self::new(resource, create_request);
+        let mut socket = Self::new(resource, create_request, status);
         socket.connection_status = SocketConnectionStatus::Connected;
         socket.local_address = Some(local_address);
+        socket.peer_address = Some(remote_address);
+        socket.connect_reported = true;
         socket
+    }
+
+    /// Returns the socket's connection state.
+    fn view(&self) -> SocketConnectionStatus {
+        if self.connect_in_flight {
+            SocketConnectionStatus::Connecting
+        } else if self.disconnected {
+            SocketConnectionStatus::Unconnected
+        } else {
+            self.connection_status
+        }
+    }
+
+    /// Returns a stream to the unconnected state, discarding its shutdowns.
+    fn reset_connection(&mut self) {
+        self.disconnected = true;
+        self.read_shutdown = false;
+        self.write_shutdown = false;
+    }
+
+    /// Returns a stream to the unconnected state once `connect` has reported
+    /// the failure of its connection attempt, claiming that failure unless
+    /// another operation has already reported it.
+    fn disconnect(&mut self) -> Option<SocketError> {
+        let error = self.errors.take_connection_failure();
+        self.reset_connection();
+        error
+    }
+
+    /// Records a shutdown, which also reports an established connection so
+    /// that a later `connect` fails.
+    fn record_shutdown(&mut self, mode: ShutdownMode) {
+        if self.view() == SocketConnectionStatus::Connected {
+            self.connect_reported = true;
+        }
+        if matches!(mode, ShutdownMode::Read | ShutdownMode::Both) {
+            self.read_shutdown = true;
+        }
+        if matches!(mode, ShutdownMode::Write | ShutdownMode::Both) {
+            self.write_shutdown = true;
+        }
+    }
+
+    /// Returns how the socket's state changes its transport's readiness.
+    fn readiness_overlay(&self) -> ReadinessOverlay {
+        let view = self.view();
+        let mut overlay = ReadinessOverlay::default();
+        if !is_udp(self.create_request) {
+            overlay.base = match view {
+                SocketConnectionStatus::Failed(_) => Some(
+                    ReadinessFlags::READ
+                        | ReadinessFlags::WRITE
+                        | ReadinessFlags::HANGUP
+                        | ReadinessFlags::CLOSED,
+                ),
+                SocketConnectionStatus::Unconnected if !self.listening => {
+                    Some(ReadinessFlags::WRITE | ReadinessFlags::CLOSED)
+                }
+                _ => None,
+            };
+        }
+        // A listener ignores shutdowns.
+        if !self.listening {
+            if self.read_shutdown {
+                overlay.add = overlay.add | ReadinessFlags::READ | ReadinessFlags::HANGUP;
+            }
+            // A send waits for a connection attempt despite a shutdown.
+            if self.write_shutdown && view != SocketConnectionStatus::Connecting {
+                overlay.add = overlay.add | ReadinessFlags::WRITE;
+            }
+            overlay.close_on_hangup = self.write_shutdown;
+        }
+        if !self.errors.is_empty() {
+            overlay.add = overlay.add | ReadinessFlags::ERROR;
+        }
+        overlay
+    }
+
+    /// Publishes the socket's readiness after a change to its state.
+    fn sync_readiness(&self) {
+        self.resource
+            .readiness_sink
+            .set_overlay(self.readiness_overlay(), false);
     }
 
     pub(crate) fn resource(&self) -> Arc<SocketResource> {
         Arc::clone(&self.resource)
     }
 
+    /// Returns the socket's access mode and status flags.
+    pub(crate) fn get_status_flags(&self) -> FileStatusFlags {
+        self.status.get(FileAccessMode::ReadWrite)
+    }
+
+    /// Changes the status flags in `mask` to their values in `flags`.
+    pub(crate) fn set_status_flags(&mut self, mask: FileOpenFlags, flags: FileOpenFlags) {
+        self.status.set(mask, flags);
+    }
+
     /// Publishes this socket's later readiness changes through
     /// `registration` until every clone of `registration` drops.
     pub(crate) fn watch(&self, registration: &ReadinessRegistration) -> Result<()> {
-        self.resource.watchers.watch(registration)
+        self.resource.readiness_sink.watchers.watch(registration)
     }
 }
 
 pub(crate) struct SocketResource {
     platform_socket: Arc<dyn PlatformSocket>,
+    /// The provider's registration, whose publications `readiness_sink`
+    /// forwards.
     readiness: ReadinessRegistration,
-    /// Registrations other than the owner's, such as readiness queue entries,
-    /// which the provider's publications also wake.
-    watchers: SharedReadinessWatchers,
+    readiness_sink: Arc<SocketReadinessSink>,
     port_binding: Mutex<Option<Arc<GuestPortBinding>>>,
     guest_source_lease: Mutex<Option<GuestSourceLease>>,
+    /// Serializes queries that queue the transport's pending error, so none
+    /// misses an error another has taken from the transport but not yet
+    /// queued.
+    error_queries: Mutex<()>,
+    /// The account the provider charges this socket to, which drops after the
+    /// socket retires.
+    account: Arc<SocketAccount>,
 }
 
 impl SocketResource {
@@ -2064,7 +3056,95 @@ impl SocketResource {
     }
 
     pub(crate) fn readiness(&self) -> ReadinessFlags {
-        self.platform_socket.readiness()
+        let transport = self.platform_socket.readiness();
+        self.readiness_sink.state.lock().overlay.apply(transport)
+    }
+}
+
+/// A pending socket error, and whether it reports a failed connection
+/// attempt, which `connect` may claim.
+#[derive(Clone, Copy)]
+enum QueuedSocketError {
+    Other(SocketError),
+    ConnectionFailure(SocketError),
+}
+
+impl QueuedSocketError {
+    fn error(self) -> SocketError {
+        match self {
+            Self::Other(error) | Self::ConnectionFailure(error) => error,
+        }
+    }
+}
+
+/// A socket's pending errors, oldest first.
+///
+/// This holds at most two: the socket's current error, and the next one,
+/// which becomes current once the current one is taken.
+#[derive(Default)]
+struct SocketErrorQueue {
+    head: Option<QueuedSocketError>,
+    next: Option<QueuedSocketError>,
+}
+
+impl SocketErrorQueue {
+    fn is_empty(&self) -> bool {
+        self.head.is_none()
+    }
+
+    /// Makes `error` the oldest error, discarding the newest if full.
+    fn prepend(&mut self, error: SocketError) {
+        self.next = self.head;
+        self.head = Some(QueuedSocketError::Other(error));
+    }
+
+    /// Makes `error` the newest error, discarding it if full.
+    fn append(&mut self, error: QueuedSocketError) {
+        if self.head.is_none() {
+            self.head = Some(error);
+        } else if self.next.is_none() {
+            self.next = Some(error);
+        }
+    }
+
+    fn take(&mut self) -> Option<SocketError> {
+        let error = self.head.take();
+        self.head = self.next.take();
+        error.map(QueuedSocketError::error)
+    }
+
+    /// Takes the newest connection failure.
+    fn take_connection_failure(&mut self) -> Option<SocketError> {
+        if let Some(QueuedSocketError::ConnectionFailure(error)) = self.next {
+            self.next = None;
+            Some(error)
+        } else if let Some(QueuedSocketError::ConnectionFailure(_)) = self.head {
+            self.take()
+        } else {
+            None
+        }
+    }
+}
+
+/// How a socket's state changes its transport's readiness.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct ReadinessOverlay {
+    /// Readiness that replaces the transport's.
+    base: Option<ReadinessFlags>,
+    /// Readiness added to the base.
+    add: ReadinessFlags,
+    /// Whether a hangup also closes the socket, because it cannot send.
+    close_on_hangup: bool,
+}
+
+impl ReadinessOverlay {
+    fn apply(self, transport: ReadinessFlags) -> ReadinessFlags {
+        let readiness = self.base.unwrap_or(transport) | self.add;
+        if self.close_on_hangup && readiness.contains(ReadinessFlags::HANGUP) {
+            readiness | ReadinessFlags::CLOSED
+        } else {
+            readiness
+        }
     }
 }
 
@@ -2099,42 +3179,148 @@ impl Drop for SocketResource {
     }
 }
 
-/// Charges one socket resource to the broker and to `process`.
-fn reserve_socket(process: &BrokerProcess) -> Result<QuotaReservation> {
+/// Charges one socket resource to the broker and to the process of `account`.
+fn reserve_socket(core: &BrokerCore, account: &SocketAccount) -> Result<QuotaReservation> {
     QuotaReservation::new(
-        &process.core.reserved_sockets,
-        process.core.limits.max_sockets,
-        &process.reserved_sockets,
-        process.core.limits.max_sockets_per_process,
+        &core.reserved_sockets,
+        core.limits.max_sockets,
+        &account.reserved_sockets,
+        core.limits.max_sockets_per_process,
     )
 }
 
+/// Creates the readiness state of a new socket for `reference`: the
+/// reference's registration with `readiness_sink`, which already watches the
+/// socket so it receives the provider's initial publication, the socket's
+/// sink, and the provider's registration with that sink, which holds `quota`
+/// until its retirement is delivered.
+fn socket_readiness(
+    reference: &PendingObjectReference<'_>,
+    readiness_sink: Arc<dyn ReadinessSink>,
+    quota: Arc<QuotaReservation>,
+) -> Result<(
+    ReadinessRegistration,
+    Arc<SocketReadinessSink>,
+    ReadinessRegistration,
+)> {
+    let registration = ReadinessRegistration::new(reference.handle(), readiness_sink);
+    let socket_sink = Arc::new(SocketReadinessSink::default());
+    socket_sink.watchers.watch(&registration)?;
+    let readiness = ReadinessRegistration::new_with_retirement_guard(
+        reference.handle(),
+        socket_sink.clone(),
+        quota,
+    );
+    Ok((registration, socket_sink, readiness))
+}
+
+/// The provider socket state and socket quota charged to one process, whose
+/// provider state [`SocketProvider::close_process`] releases once the process
+/// has released its references and every socket charged to it has retired.
+///
+/// Each socket charged to the process holds this, and so does the process
+/// until it releases its references. It keeps the process's ID allocated, so
+/// a later process cannot reuse the ID while the provider still charges
+/// state to it.
+pub(crate) struct SocketAccount {
+    process_id: ProcessId,
+    /// Socket quota held by the pending, live, and closing in-flight
+    /// resources charged to the process.
+    reserved_sockets: Arc<AtomicUsize>,
+    socket_provider: Arc<dyn SocketProvider>,
+    ids: Arc<Mutex<IdAllocator>>,
+}
+
+impl SocketAccount {
+    /// Creates the account of the process with the allocated ID `process_id`.
+    pub(crate) fn new(core: &BrokerCore, process_id: ProcessId) -> Self {
+        core.ids.lock().retain(process_id.0);
+        Self {
+            process_id,
+            reserved_sockets: Arc::new(AtomicUsize::new(0)),
+            socket_provider: Arc::clone(&core.socket_provider),
+            ids: Arc::clone(&core.ids),
+        }
+    }
+}
+
+impl Drop for SocketAccount {
+    fn drop(&mut self) {
+        self.socket_provider.close_process(self.process_id);
+        self.ids.lock().release(self.process_id.0);
+    }
+}
+
 /// Readiness sink of one socket resource, which forwards its provider's
-/// publications to the owning association and wakes the socket's watchers.
+/// publications, changed by the socket's state, to the socket's watchers: the
+/// registrations of every reference to the socket and of readiness queue
+/// entries watching it.
+#[derive(Default)]
 struct SocketReadinessSink {
-    owner: Arc<dyn ReadinessSink>,
     watchers: SharedReadinessWatchers,
+    state: Mutex<SocketReadinessState>,
+}
+
+#[derive(Default)]
+struct SocketReadinessState {
+    /// The provider's latest publication.
+    transport: ReadinessFlags,
+    overlay: ReadinessOverlay,
+    retired: bool,
+}
+
+impl SocketReadinessSink {
+    /// Changes how the socket's state changes its transport's readiness,
+    /// publishing the socket's readiness if that changes it or, with
+    /// `republish`, regardless.
+    fn set_overlay(&self, overlay: ReadinessOverlay, republish: bool) {
+        let mut state = self.state.lock();
+        if state.retired {
+            return;
+        }
+        let before = state.overlay.apply(state.transport);
+        let after = overlay.apply(state.transport);
+        state.overlay = overlay;
+        if republish {
+            self.watchers.publish(after);
+        } else if before != after {
+            self.watchers.publish_if_changed(after);
+        }
+    }
+
+    fn forward(&self, transport: ReadinessFlags, republish: bool) {
+        // Publishing under the lock keeps publications in order.
+        let mut state = self.state.lock();
+        if state.retired {
+            return;
+        }
+        state.transport = transport;
+        let readiness = state.overlay.apply(transport);
+        if republish {
+            self.watchers.publish(readiness);
+        } else {
+            self.watchers.publish_if_changed(readiness);
+        }
+    }
 }
 
 impl ReadinessSink for SocketReadinessSink {
     fn max_tracked_objects(&self) -> usize {
-        self.owner.max_tracked_objects()
+        1
     }
 
-    fn publish(&self, handle: ObjectHandle, readiness: ReadinessFlags) -> Result<()> {
-        let result = self.owner.publish(handle, readiness);
-        self.watchers.publish(readiness);
-        result
+    fn publish(&self, _handle: ObjectHandle, readiness: ReadinessFlags) -> Result<()> {
+        self.forward(readiness, false);
+        Ok(())
     }
 
-    fn republish(&self, handle: ObjectHandle, readiness: ReadinessFlags) -> Result<()> {
-        let result = self.owner.republish(handle, readiness);
-        self.watchers.publish(readiness);
-        result
+    fn republish(&self, _handle: ObjectHandle, readiness: ReadinessFlags) -> Result<()> {
+        self.forward(readiness, true);
+        Ok(())
     }
 
-    fn retire(&self, handle: ObjectHandle) {
-        self.owner.retire(handle);
+    fn retire(&self, _handle: ObjectHandle) {
+        self.state.lock().retired = true;
     }
 }
 

@@ -33,12 +33,13 @@ use crate::shared_buffer::SharedBufferSequence;
 use crate::signal::{OpenSignalsResponse, SendSignalRequest, SignalEvent, TakeSignalRequest};
 use crate::socket::{
     AcceptSocketRequest, AcceptSocketResponse, BindSocketRequest, BindSocketResponse,
-    ConnectSocketRequest, ConnectSocketResponse, CreateSocketRequest, CreateSocketResponse,
-    GetTcpOptionRequest, GetTcpOptionResponse, ListenSocketRequest, ListenSocketResponse,
-    ReceiveFromSocketRequest, ReceiveFromSocketResponse, ReceiveSocketRequest,
-    ReceiveSocketResponse, SendSocketRequest, SendSocketResponse, SendToSocketRequest,
-    SendToSocketResponse, SetTcpOptionRequest, ShutdownSocketRequest, SocketError,
-    SocketStatusRequest, SocketStatusResponse,
+    CheckConnectSocketRequest, ConnectSocketRequest, ConnectSocketResponse, CreateSocketRequest,
+    CreateSocketResponse, GetSocketNameRequest, GetSocketNameResponse, GetSocketOptionRequest,
+    GetSocketOptionResponse, ListenSocketRequest, ListenSocketResponse, ReceiveFromSocketRequest,
+    ReceiveFromSocketResponse, ReceiveSocketRequest, ReceiveSocketResponse, SendSocketRequest,
+    SendSocketResponse, SendToSocketRequest, SendToSocketResponse, SetSocketErrorRequest,
+    SetSocketOptionRequest, ShutdownSocketRequest, SocketError, TakeSocketErrorRequest,
+    TakeSocketErrorResponse,
 };
 use crate::timer::{
     CreateTimerRequest, CreateTimerResponse, GetTimerRequest, GetTimerResponse, ReadTimerRequest,
@@ -180,9 +181,12 @@ impl BrokerOperation {
                 | SocketRequest::Listen(_)
                 | SocketRequest::Accept(_)
                 | SocketRequest::Shutdown(_)
-                | SocketRequest::SetTcpOption(_)
-                | SocketRequest::GetTcpOption(_)
-                | SocketRequest::Status(_),
+                | SocketRequest::SetOption(_)
+                | SocketRequest::GetOption(_)
+                | SocketRequest::CheckConnect(_)
+                | SocketRequest::GetName(_)
+                | SocketRequest::TakeError(_)
+                | SocketRequest::SetError(_),
             )
             | Self::File(
                 FileRequest::Seek(_)
@@ -444,12 +448,18 @@ pub enum SocketRequest {
     ReceiveFrom(ReceiveFromSocketRequest),
     /// Shut down one or both directions.
     Shutdown(ShutdownSocketRequest),
-    /// Set a typed TCP socket option.
-    SetTcpOption(SetTcpOptionRequest),
-    /// Read a typed TCP socket option.
-    GetTcpOption(GetTcpOptionRequest),
-    /// Read a socket's connection state.
-    Status(SocketStatusRequest),
+    /// Set a socket option.
+    SetOption(SetSocketOptionRequest),
+    /// Read a socket option.
+    GetOption(GetSocketOptionRequest),
+    /// Check the progress of a connection attempt.
+    CheckConnect(CheckConnectSocketRequest),
+    /// Read the local or peer address.
+    GetName(GetSocketNameRequest),
+    /// Take the oldest pending error.
+    TakeError(TakeSocketErrorRequest),
+    /// Report an error before any already pending one.
+    SetError(SetSocketErrorRequest),
 }
 
 /// Result returned for an active broker operation.
@@ -637,20 +647,22 @@ pub enum SocketResponse {
     ReceiveFrom(ReceiveFromSocketResponse),
     /// Shutdown operation completed.
     Shutdown,
-    /// TCP socket option was updated.
-    SetTcpOption,
-    /// TCP socket option response.
-    GetTcpOption(GetTcpOptionResponse),
-    /// Status operation response.
-    Status(SocketStatusResponse),
-    /// A host network operation failed.
+    /// Socket option was updated.
+    SetOption,
+    /// Socket option response.
+    GetOption(GetSocketOptionResponse),
+    /// Check-connect operation response.
+    CheckConnect(ConnectSocketResponse),
+    /// Address operation response.
+    GetName(GetSocketNameResponse),
+    /// Take-error operation response.
+    TakeError(TakeSocketErrorResponse),
+    /// Socket error was reported.
+    SetError,
+    /// A socket operation failed with an ordinary socket error.
     ///
-    /// Stream connect and status responses carry terminal connection failures
-    /// in [`SocketConnectionStatus`]. Datagram connect failures and other
-    /// ordinary socket failures use this variant. Broker and request-validation
-    /// failures use [`BrokerResult::Error`] instead.
-    ///
-    /// [`SocketConnectionStatus`]: crate::socket::SocketConnectionStatus
+    /// Broker and request-validation failures use [`BrokerResult::Error`]
+    /// instead.
     Failed(SocketError),
 }
 

@@ -10,8 +10,10 @@
 //! or flag the broker has not agreed to support.
 
 use core::net::SocketAddrV4;
+use core::time::Duration;
 
 use crate::ObjectHandle;
+use crate::fs::FileOpenFlags;
 use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
 use thiserror::Error;
 
@@ -80,24 +82,60 @@ pub enum ShutdownMode {
     StopListening,
 }
 
-/// Broker-supported TCP socket option name.
+/// Socket option name, shared by internet and Unix sockets.
+///
+/// Every reference to a socket shares its options.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum TcpOptionName {
-    /// Disable or enable Nagle's algorithm.
-    NoDelay,
-    /// Enable or disable TCP keepalive probes.
+pub enum SocketOptionName {
+    /// Longest time a blocking receive or accept waits.
+    ReceiveTimeout,
+    /// Longest time a blocking send or connect waits.
+    SendTimeout,
+    /// Linger time on close.
+    Linger,
+    /// Whether address reuse was requested.
+    ReuseAddress,
+    /// Whether keepalive was requested, which enables keepalive probes on a
+    /// TCP socket.
     KeepAlive,
+    /// Whether broadcast was requested.
+    Broadcast,
+    /// Whether Nagle's algorithm is disabled, which only TCP sockets support.
+    NoDelay,
 }
 
-/// Broker-supported TCP socket option value.
+/// Socket option value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum TcpOptionValue {
-    /// Whether Nagle's algorithm is disabled.
-    NoDelay(bool),
-    /// Whether TCP keepalive probes are enabled.
+pub enum SocketOptionValue {
+    /// [`SocketOptionName::ReceiveTimeout`], or `None` to wait indefinitely.
+    ReceiveTimeout(Option<Duration>),
+    /// [`SocketOptionName::SendTimeout`], or `None` to wait indefinitely.
+    SendTimeout(Option<Duration>),
+    /// [`SocketOptionName::Linger`], or `None` to close in the background.
+    Linger(Option<Duration>),
+    /// [`SocketOptionName::ReuseAddress`].
+    ReuseAddress(bool),
+    /// [`SocketOptionName::KeepAlive`].
     KeepAlive(bool),
+    /// [`SocketOptionName::Broadcast`].
+    Broadcast(bool),
+    /// [`SocketOptionName::NoDelay`].
+    NoDelay(bool),
+}
+
+impl SocketOptionValue {
+    /// Returns the name of the option this value sets.
+    pub fn name(self) -> SocketOptionName {
+        match self {
+            Self::ReceiveTimeout(_) => SocketOptionName::ReceiveTimeout,
+            Self::SendTimeout(_) => SocketOptionName::SendTimeout,
+            Self::Linger(_) => SocketOptionName::Linger,
+            Self::ReuseAddress(_) => SocketOptionName::ReuseAddress,
+            Self::KeepAlive(_) => SocketOptionName::KeepAlive,
+            Self::Broadcast(_) => SocketOptionName::Broadcast,
+            Self::NoDelay(_) => SocketOptionName::NoDelay,
+        }
+    }
 }
 
 /// IPv4 address in network byte order.
@@ -255,6 +293,27 @@ pub enum SocketError {
     /// The host stack failed in a way this protocol does not distinguish.
     #[error("other socket error")]
     Other,
+    /// The socket is already connected.
+    #[error("socket is already connected")]
+    AlreadyConnected,
+    /// A connection attempt is already in progress.
+    #[error("connection already in progress")]
+    AlreadyInProgress,
+    /// The direction the operation needs has been shut down.
+    #[error("socket direction is shut down")]
+    Shutdown,
+    /// A datagram send on an unconnected socket named no destination.
+    #[error("destination address required")]
+    DestinationAddressRequired,
+    /// The operation is not valid on a listening socket.
+    #[error("socket is listening")]
+    Listening,
+    /// Socket resources are exhausted.
+    #[error("socket resources exhausted")]
+    ResourceExhausted,
+    /// The socket does not support the operation.
+    #[error("socket operation unsupported")]
+    UnsupportedOperation,
 }
 
 /// Result of a socket operation that can fail with an ordinary network outcome.
@@ -276,6 +335,8 @@ pub struct CreateSocketRequest {
     pub socket_type: SocketType,
     /// Transport protocol.
     pub protocol: IpProtocol,
+    /// Initial status flags, within [`FileOpenFlags::STATUS`].
+    pub flags: FileOpenFlags,
 }
 
 /// Response to a socket create request.
@@ -338,6 +399,8 @@ pub struct ListenSocketResponse {
 pub struct AcceptSocketRequest {
     /// Listening socket handle.
     pub handle: ObjectHandle,
+    /// Status flags of the accepted socket, within [`FileOpenFlags::STATUS`].
+    pub flags: FileOpenFlags,
 }
 
 /// Response containing one accepted broker socket.
@@ -355,13 +418,12 @@ pub struct AcceptSocketResponse {
 ///
 /// The broker only performs non-blocking operations, so a connect that cannot
 /// complete immediately reports [`Self::Connecting`] rather than waiting. The
-/// caller waits for write readiness and then reads the authoritative state with
-/// a status request.
+/// caller waits for write readiness and then finishes the attempt with a
+/// check-connect request.
 ///
-/// Stream connected and failed states are terminal and idempotent. Datagram
-/// connects complete immediately, may replace an existing peer, and report a
-/// synchronous failure as an operation failure rather than storing
-/// [`Self::Failed`].
+/// Connect and check-connect responses report a failed attempt as an
+/// operation failure, so they never carry [`Self::Failed`]. Datagram connects
+/// complete immediately and may replace an existing peer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SocketConnectionStatus {
@@ -474,45 +536,73 @@ pub struct ShutdownSocketRequest {
     pub mode: ShutdownMode,
 }
 
-/// Request to set a typed TCP socket option.
+/// Request to set a socket option.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SetTcpOptionRequest {
+pub struct SetSocketOptionRequest {
     /// Socket handle.
     pub handle: ObjectHandle,
     /// Option value to apply.
-    pub value: TcpOptionValue,
+    pub value: SocketOptionValue,
 }
 
-/// Request to read a typed TCP socket option.
+/// Request to read a socket option.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GetTcpOptionRequest {
+pub struct GetSocketOptionRequest {
     /// Socket handle.
     pub handle: ObjectHandle,
     /// Option name to read.
-    pub name: TcpOptionName,
+    pub name: SocketOptionName,
 }
 
-/// Response containing a typed TCP socket option value.
+/// Response containing a socket option value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GetTcpOptionResponse {
-    /// Authoritative option value returned by the platform socket.
-    pub value: TcpOptionValue,
+pub struct GetSocketOptionResponse {
+    /// Stored option value.
+    pub value: SocketOptionValue,
 }
 
-/// Request for a socket's connection state.
+/// Request to check the progress of a socket's connection attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SocketStatusRequest {
+pub struct CheckConnectSocketRequest {
     /// Socket handle.
     pub handle: ObjectHandle,
 }
 
-/// Response describing a socket's broker-authoritative connection state.
+/// Request for the local or peer address of a socket.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SocketStatusResponse {
-    /// Current connection state.
-    pub status: SocketConnectionStatus,
-    /// Local endpoint assigned by the host network stack, if any.
-    pub local_address: Option<SocketAddrV4>,
-    /// Pending asynchronous socket error, consumed by this status query.
-    pub pending_error: Option<SocketError>,
+pub struct GetSocketNameRequest {
+    /// Socket handle.
+    pub handle: ObjectHandle,
+    /// Whether to read the peer's address instead of the socket's own.
+    pub peer: bool,
+}
+
+/// Response containing a socket address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GetSocketNameResponse {
+    /// Requested address, or `None` if the socket has none.
+    pub address: Option<SocketAddrV4>,
+}
+
+/// Request to take a socket's oldest pending error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TakeSocketErrorRequest {
+    /// Socket handle.
+    pub handle: ObjectHandle,
+}
+
+/// Response containing a socket's oldest pending error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TakeSocketErrorResponse {
+    /// Taken error, or `None` if no error was pending.
+    pub error: Option<SocketError>,
+}
+
+/// Request to report an error before any already pending one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetSocketErrorRequest {
+    /// Socket handle.
+    pub handle: ObjectHandle,
+    /// Error to report.
+    pub error: SocketError,
 }

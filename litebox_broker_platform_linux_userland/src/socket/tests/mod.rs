@@ -16,6 +16,7 @@ use litebox_broker_core::{
     DestinationRule, Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy,
 };
 use litebox_broker_protocol::ObjectHandle;
+use litebox_broker_protocol::fs::FileOpenFlags;
 use litebox_broker_protocol::socket::{Ipv4Address, Port, ReceiveSocketResponse};
 
 use super::tcp::TcpPendingErrors;
@@ -270,160 +271,6 @@ impl ReadinessSink for TestReadinessSink {
     }
 }
 
-struct PendingPublishFailure {
-    handle: Option<ObjectHandle>,
-    required: ReadinessFlags,
-    forbidden: ReadinessFlags,
-}
-
-struct FailingReadinessSink {
-    inner: TestReadinessSink,
-    fail_next_publish: Mutex<Option<PendingPublishFailure>>,
-}
-
-impl FailingReadinessSink {
-    fn fail_next_publish_for(&self, handle: ObjectHandle) {
-        self.fail_next_publish_matching(
-            handle,
-            ReadinessFlags::default(),
-            ReadinessFlags::default(),
-        );
-    }
-
-    fn fail_next_publish_matching(
-        &self,
-        handle: ObjectHandle,
-        required: ReadinessFlags,
-        forbidden: ReadinessFlags,
-    ) {
-        *self.fail_next_publish.lock().unwrap() = Some(PendingPublishFailure {
-            handle: Some(handle),
-            required,
-            forbidden,
-        });
-    }
-
-    fn fail_next_publish_matching_any(&self, required: ReadinessFlags, forbidden: ReadinessFlags) {
-        *self.fail_next_publish.lock().unwrap() = Some(PendingPublishFailure {
-            handle: None,
-            required,
-            forbidden,
-        });
-    }
-
-    fn assert_no_pending_publish_failure(&self) {
-        assert!(self.fail_next_publish.lock().unwrap().is_none());
-    }
-
-    fn wait_for_publish_failure_consumed(&self) {
-        let deadline = Instant::now() + TEST_TIMEOUT;
-        loop {
-            if self.fail_next_publish.lock().unwrap().is_none() {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting for readiness failure injection"
-            );
-            thread::sleep(Duration::from_millis(1));
-        }
-    }
-}
-
-impl ReadinessSink for FailingReadinessSink {
-    fn max_tracked_objects(&self) -> usize {
-        self.inner.max_tracked_objects()
-    }
-
-    fn publish(&self, handle: ObjectHandle, readiness: ReadinessFlags) -> BrokerResult<()> {
-        let mut fail_next_publish = self.fail_next_publish.lock().unwrap();
-        let should_fail = fail_next_publish.as_ref().is_some_and(|failure| {
-            failure.handle.is_none_or(|failed| failed == handle)
-                && readiness.contains(failure.required)
-                && readiness.0 & failure.forbidden.0 == 0
-        });
-        if should_fail {
-            *fail_next_publish = None;
-            return Err(BrokerError::ResourceExhausted);
-        }
-        drop(fail_next_publish);
-        self.inner.publish(handle, readiness)
-    }
-
-    fn republish(&self, handle: ObjectHandle, readiness: ReadinessFlags) -> BrokerResult<()> {
-        self.publish(handle, readiness)
-    }
-
-    fn retire(&self, handle: ObjectHandle) {
-        self.inner.retire(handle);
-    }
-}
-
-#[test]
-fn directional_shutdown_survives_readiness_publication_failure() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    let (release_server, wait_to_release_server) = channel();
-    let server = thread::spawn(move || {
-        let (_stream, _) = listener.accept().unwrap();
-        wait_to_release_server.recv_timeout(TEST_TIMEOUT).unwrap();
-    });
-
-    let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
-    let broker = test_broker_core(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(gateway_tcp_policy()),
-        BrokerCoreLimits::new_with_all_limits(4, 0, 2, 2),
-        provider,
-    )
-    .unwrap();
-    let process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
-    let (published, publications) = channel();
-    let (retired, _retirements) = channel();
-    let readiness = Arc::new(FailingReadinessSink {
-        inner: TestReadinessSink { published, retired },
-        fail_next_publish: Mutex::new(None),
-    });
-
-    let tcp = create_socket(&process, readiness.clone());
-    assert!(matches!(
-        litebox_broker_core::socket::connect(
-            &process,
-            tcp,
-            gateway_address(socket_address_v4(address)),
-        ),
-        Ok(SocketOutcome::Completed(
-            SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
-        ))
-    ));
-    wait_until_connected(&process, tcp, &publications);
-    readiness.fail_next_publish_matching(tcp, ReadinessFlags::READ, ReadinessFlags::WRITE);
-    assert_eq!(
-        litebox_broker_core::socket::shutdown(&process, tcp, ShutdownMode::Both),
-        Ok(SocketOutcome::Completed(()))
-    );
-    readiness.assert_no_pending_publish_failure();
-    let tcp_readiness = process.check_readiness(tcp).unwrap();
-    assert!(tcp_readiness.contains(ReadinessFlags::READ));
-    assert!(!tcp_readiness.contains(ReadinessFlags::WRITE));
-
-    let udp = create_udp_socket(&process, readiness.clone());
-    readiness.fail_next_publish_matching(udp, ReadinessFlags::READ, ReadinessFlags::WRITE);
-    assert_eq!(
-        litebox_broker_core::socket::shutdown(&process, udp, ShutdownMode::Both),
-        Ok(SocketOutcome::Completed(()))
-    );
-    readiness.assert_no_pending_publish_failure();
-    let udp_readiness = process.check_readiness(udp).unwrap();
-    assert!(udp_readiness.contains(ReadinessFlags::READ));
-    assert!(!udp_readiness.contains(ReadinessFlags::WRITE));
-
-    release_server.send(()).unwrap();
-    server.join().unwrap();
-}
-
 fn socket_address_v4(address: std::net::SocketAddr) -> SocketAddrV4 {
     let std::net::SocketAddr::V4(address) = address else {
         panic!("loopback TCP test unexpectedly used IPv6");
@@ -451,6 +298,7 @@ fn create_socket(
             address_family: AddressFamily::Ipv4,
             socket_type: SocketType::Stream,
             protocol: IpProtocol::Tcp,
+            flags: FileOpenFlags::NONE,
         },
         readiness,
     )
@@ -467,6 +315,7 @@ fn create_udp_socket(
             address_family: AddressFamily::Ipv4,
             socket_type: SocketType::Datagram,
             protocol: IpProtocol::Udp,
+            flags: FileOpenFlags::NONE,
         },
         readiness,
     )
@@ -503,18 +352,17 @@ fn wait_until_failed(
     handle: ObjectHandle,
     publications: &Receiver<(ObjectHandle, ReadinessFlags)>,
 ) -> SocketError {
-    let deadline = Instant::now() + TEST_TIMEOUT;
-    loop {
-        match litebox_broker_core::socket::status(process, handle)
-            .unwrap()
-            .status
-        {
-            SocketConnectionStatus::Connecting => {
-                wait_for_readiness_until(publications, handle, ReadinessFlags::ERROR, deadline);
-            }
-            SocketConnectionStatus::Failed(error) => return error,
-            status => panic!("unexpected connect status: {status:?}"),
-        }
+    // Like a guest, observe the failure through readiness, which queues it.
+    // Readiness can show the transport's error before the broker has seen the
+    // failure, so check once more to queue it before `status` consumes it.
+    wait_until_ready(process, publications, handle, ReadinessFlags::ERROR);
+    process.check_readiness(handle).unwrap();
+    match litebox_broker_core::socket::status(process, handle)
+        .unwrap()
+        .status
+    {
+        SocketConnectionStatus::Failed(error) => error,
+        status => panic!("unexpected connect status: {status:?}"),
     }
 }
 

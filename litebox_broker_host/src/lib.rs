@@ -1157,6 +1157,7 @@ fn handle_socket_request<Memory: SharedMemory>(
             match litebox_broker_core::socket::accept(
                 process,
                 request.handle,
+                request.flags,
                 Arc::clone(readiness_sink),
             )
             .map_err(RequestFailure::from)?
@@ -1317,23 +1318,53 @@ fn handle_socket_request<Memory: SharedMemory>(
                 SocketOutcome::Failed(error) => Ok(SocketResponse::Failed(error)),
             }
         }
-        SocketRequest::SetTcpOption(request) => {
-            litebox_broker_core::socket::set_tcp_option(process, request.handle, request.value)
-                .map(|()| SocketResponse::SetTcpOption)
+        SocketRequest::SetOption(request) => {
+            litebox_broker_core::socket::set_option(process, request.handle, request.value)
+                .map(|()| SocketResponse::SetOption)
                 .map_err(RequestFailure::from)
         }
-        SocketRequest::GetTcpOption(request) => {
-            litebox_broker_core::socket::get_tcp_option(process, request.handle, request.name)
+        SocketRequest::GetOption(request) => {
+            litebox_broker_core::socket::get_option(process, request.handle, request.name)
                 .map(|value| {
-                    SocketResponse::GetTcpOption(
-                        litebox_broker_protocol::socket::GetTcpOptionResponse { value },
+                    SocketResponse::GetOption(
+                        litebox_broker_protocol::socket::GetSocketOptionResponse { value },
                     )
                 })
                 .map_err(RequestFailure::from)
         }
-        SocketRequest::Status(request) => {
-            litebox_broker_core::socket::status(process, request.handle)
-                .map(SocketResponse::Status)
+        SocketRequest::CheckConnect(request) => {
+            match litebox_broker_core::socket::check_connect(process, request.handle)
+                .map_err(RequestFailure::from)?
+            {
+                SocketOutcome::Completed(status) => {
+                    Ok(SocketResponse::CheckConnect(ConnectSocketResponse {
+                        status,
+                    }))
+                }
+                SocketOutcome::Failed(error) => Ok(SocketResponse::Failed(error)),
+            }
+        }
+        SocketRequest::GetName(request) => {
+            litebox_broker_core::socket::get_name(process, request.handle, request.peer)
+                .map(|address| {
+                    SocketResponse::GetName(
+                        litebox_broker_protocol::socket::GetSocketNameResponse { address },
+                    )
+                })
+                .map_err(RequestFailure::from)
+        }
+        SocketRequest::TakeError(request) => {
+            litebox_broker_core::socket::take_error(process, request.handle)
+                .map(|error| {
+                    SocketResponse::TakeError(
+                        litebox_broker_protocol::socket::TakeSocketErrorResponse { error },
+                    )
+                })
+                .map_err(RequestFailure::from)
+        }
+        SocketRequest::SetError(request) => {
+            litebox_broker_core::socket::set_error(process, request.handle, request.error)
+                .map(|()| SocketResponse::SetError)
                 .map_err(RequestFailure::from)
         }
     }
@@ -1795,12 +1826,12 @@ mod tests {
         SharedBufferSlotIndex,
     };
     use litebox_broker_protocol::socket::{
-        AddressFamily, ConnectSocketRequest, CreateSocketRequest, IpProtocol, ReceiveFlags,
-        ReceiveFromFlags, ReceiveFromSocketRequest, ReceiveFromSocketResponse,
-        ReceiveSocketRequest, SendFlags, SendSocketRequest, SendToSocketRequest,
-        SendToSocketResponse, ShutdownMode, ShutdownSocketRequest, SocketConnectionStatus,
-        SocketError, SocketStatusRequest, SocketStatusResponse, SocketType, TcpOptionName,
-        TcpOptionValue,
+        AddressFamily, CheckConnectSocketRequest, ConnectSocketRequest, CreateSocketRequest,
+        GetSocketNameRequest, GetSocketNameResponse, IpProtocol, ReceiveFlags, ReceiveFromFlags,
+        ReceiveFromSocketRequest, ReceiveFromSocketResponse, ReceiveSocketRequest, SendFlags,
+        SendSocketRequest, SendToSocketRequest, SendToSocketResponse, ShutdownMode,
+        ShutdownSocketRequest, SocketConnectionStatus, SocketError, SocketOptionName,
+        SocketOptionValue, SocketType,
     };
     use litebox_broker_protocol::timer::{
         CreateTimerRequest, GetTimerRequest, ReadTimerRequest, SetTimerRequest, TimerSpec,
@@ -2011,8 +2042,7 @@ mod tests {
                 *self.local_address.lock().unwrap() = Some(source_address);
             }
             self.readiness
-                .publish(litebox_broker_protocol::readiness::ReadinessFlags::WRITE)
-                .map_err(PlatformConnectError::PeerUnchanged)?;
+                .publish(litebox_broker_protocol::readiness::ReadinessFlags::WRITE);
             if self.create_request.socket_type == SocketType::Datagram {
                 Ok(SocketConnectionStatus::Connected)
             } else {
@@ -2039,6 +2069,7 @@ mod tests {
 
         fn receive(
             &self,
+            _reader: ObjectHandle,
             length: usize,
             _flags: ReceiveFlags,
             _peek_offset: u32,
@@ -2067,17 +2098,17 @@ mod tests {
             Ok(SocketOutcome::Completed(()))
         }
 
-        fn set_tcp_option(&self, _value: TcpOptionValue) -> litebox_broker_core::Result<()> {
+        fn set_tcp_option(&self, _value: SocketOptionValue) -> litebox_broker_core::Result<()> {
             Ok(())
         }
 
         fn get_tcp_option(
             &self,
-            name: TcpOptionName,
-        ) -> litebox_broker_core::Result<TcpOptionValue> {
+            name: SocketOptionName,
+        ) -> litebox_broker_core::Result<SocketOptionValue> {
             match name {
-                TcpOptionName::NoDelay => Ok(TcpOptionValue::NoDelay(false)),
-                TcpOptionName::KeepAlive => Ok(TcpOptionValue::KeepAlive(false)),
+                SocketOptionName::NoDelay => Ok(SocketOptionValue::NoDelay(false)),
+                SocketOptionName::KeepAlive => Ok(SocketOptionValue::KeepAlive(false)),
                 _ => Err(litebox_broker_core::BrokerError::UnsupportedOperation),
             }
         }
@@ -3245,6 +3276,7 @@ mod tests {
                 address_family: AddressFamily::Ipv4,
                 socket_type: SocketType::Stream,
                 protocol: IpProtocol::Tcp,
+                flags: FileOpenFlags::NONE,
             })),
             &shared_buffers,
         );
@@ -3279,15 +3311,26 @@ mod tests {
         assert_eq!(
             handle_test_request_with_buffers(
                 &process,
-                BrokerOperation::Socket(SocketRequest::Status(SocketStatusRequest {
+                BrokerOperation::Socket(SocketRequest::CheckConnect(CheckConnectSocketRequest {
                     handle: response.handle,
                 })),
                 &shared_buffers,
             ),
-            BrokerResult::Socket(SocketResponse::Status(SocketStatusResponse {
+            BrokerResult::Socket(SocketResponse::CheckConnect(ConnectSocketResponse {
                 status: SocketConnectionStatus::Connected,
-                local_address: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152)),
-                pending_error: None,
+            }))
+        );
+        assert_eq!(
+            handle_test_request_with_buffers(
+                &process,
+                BrokerOperation::Socket(SocketRequest::GetName(GetSocketNameRequest {
+                    handle: response.handle,
+                    peer: false,
+                })),
+                &shared_buffers,
+            ),
+            BrokerResult::Socket(SocketResponse::GetName(GetSocketNameResponse {
+                address: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152)),
             }))
         );
 
@@ -3396,6 +3439,7 @@ mod tests {
                 address_family: AddressFamily::Ipv4,
                 socket_type: SocketType::Datagram,
                 protocol: IpProtocol::Udp,
+                flags: FileOpenFlags::NONE,
             })),
             &shared_buffers,
         );

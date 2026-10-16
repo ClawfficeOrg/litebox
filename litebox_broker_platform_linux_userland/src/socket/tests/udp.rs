@@ -178,7 +178,7 @@ fn connected_udp_gateway_preserves_guest_visible_mapping() {
 }
 
 #[test]
-fn unmatched_guest_udp_destinations_fail_closed() {
+fn unmatched_guest_udp_destinations_are_port_unreachable() {
     let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
@@ -207,336 +207,58 @@ fn unmatched_guest_udp_destinations_fail_closed() {
                 SendFlags::NONE,
                 Some(destination),
             ),
-            Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+            Ok(SocketOutcome::Completed(7))
         );
     }
+    let has_error = || {
+        process
+            .check_readiness(socket)
+            .unwrap()
+            .contains(ReadinessFlags::ERROR)
+    };
+    assert!(!has_error(), "unconnected senders must not see refusals");
     assert_eq!(
         litebox_broker_core::socket::connect(&process, socket, loopback_miss),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+    );
+    assert_eq!(
+        send_datagram(&process, socket, b"blocked", SendFlags::NONE, None),
+        Ok(SocketOutcome::Completed(7))
+    );
+    assert!(has_error());
+    assert_eq!(
+        send_datagram(&process, socket, b"blocked", SendFlags::NONE, None),
         Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+    );
+    assert!(!has_error());
+    assert_eq!(
+        send_datagram(&process, socket, b"blocked", SendFlags::NONE, None),
+        Ok(SocketOutcome::Completed(7))
+    );
+    assert_eq!(
+        receive_datagram_into(&process, socket, &mut [0; 7], ReceiveFromFlags::NONE),
+        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+    );
+    assert!(!has_error());
+    assert_eq!(
+        send_datagram(
+            &process,
+            socket,
+            b"blocked",
+            SendFlags::NONE,
+            Some(private_miss),
+        ),
+        Ok(SocketOutcome::Completed(7))
+    );
+    assert!(
+        !has_error(),
+        "only datagrams to the connected peer report refusals"
     );
     assert_eq!(provider.reactor.udp_native_endpoint_count(), 0);
     assert_eq!(
         host.recv_from(&mut [0; 7]).unwrap_err().kind(),
         ErrorKind::WouldBlock
     );
-}
-
-#[test]
-fn failed_initial_udp_readiness_does_not_retain_process_state() {
-    let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
-    let broker = test_broker_core(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::guest_network()),
-        BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
-        provider.clone(),
-    )
-    .unwrap();
-    let process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
-    let (published, _publications) = channel();
-    let (retired, _retirements) = channel();
-    let readiness = Arc::new(FailingReadinessSink {
-        inner: TestReadinessSink { published, retired },
-        fail_next_publish: Mutex::new(None),
-    });
-    readiness.fail_next_publish_matching_any(ReadinessFlags::WRITE, ReadinessFlags::default());
-
-    assert!(matches!(
-        litebox_broker_core::socket::create(
-            &process,
-            CreateSocketRequest {
-                address_family: AddressFamily::Ipv4,
-                socket_type: SocketType::Datagram,
-                protocol: IpProtocol::Udp,
-            },
-            readiness,
-        ),
-        Err(BrokerError::ResourceExhausted)
-    ));
-    assert_eq!(provider.reactor.process_state_count(), 0);
-}
-
-#[test]
-fn guest_udp_readiness_failure_rolls_back_enqueue() {
-    let provider = Arc::new(LinuxSocketProvider::new(2, 1).unwrap());
-    let broker = test_broker_core(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::guest_network()),
-        BrokerCoreLimits::new_with_all_limits(4, 0, 2, 1),
-        provider.clone(),
-    )
-    .unwrap();
-    let receiver_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
-    let sender_process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
-    let (published, _publications) = channel();
-    let (retired, _retirements) = channel();
-    let readiness = Arc::new(FailingReadinessSink {
-        inner: TestReadinessSink { published, retired },
-        fail_next_publish: Mutex::new(None),
-    });
-    let receiver = create_udp_socket(&receiver_process, readiness.clone());
-    let receiver_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 18100);
-    assert_eq!(
-        litebox_broker_core::socket::bind(&receiver_process, receiver, receiver_address,),
-        Ok(SocketOutcome::Completed(receiver_address))
-    );
-    let sender = create_udp_socket(&sender_process, readiness.clone());
-
-    readiness.fail_next_publish_for(receiver);
-    assert_eq!(
-        send_datagram(
-            &sender_process,
-            sender,
-            b"dropped",
-            SendFlags::NONE,
-            Some(receiver_address),
-        ),
-        Ok(SocketOutcome::Completed(7))
-    );
-    assert_eq!(provider.reactor.udp_queued_datagram_count(), 0);
-    let mut data = [0; 7];
-    assert_eq!(
-        receive_datagram_into(
-            &receiver_process,
-            receiver,
-            &mut data,
-            ReceiveFromFlags::NONE,
-        ),
-        Err(BrokerError::WouldBlock)
-    );
-    readiness.assert_no_pending_publish_failure();
-
-    assert_eq!(
-        send_datagram(
-            &sender_process,
-            sender,
-            b"queued",
-            SendFlags::NONE,
-            Some(receiver_address),
-        ),
-        Ok(SocketOutcome::Completed(6))
-    );
-    assert_eq!(provider.reactor.udp_queued_datagram_count(), 1);
-    let sender_address = litebox_broker_core::socket::status(&sender_process, sender)
-        .unwrap()
-        .local_address
-        .map(|address| SocketAddrV4::new(Ipv4Addr::LOCALHOST, address.port()))
-        .unwrap();
-
-    readiness.fail_next_publish_for(receiver);
-    let mut data = [0; 6];
-    assert_eq!(
-        receive_datagram_into(
-            &receiver_process,
-            receiver,
-            &mut data,
-            ReceiveFromFlags::NONE,
-        ),
-        Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
-            received: 6,
-            datagram_length: 6,
-            source_address: sender_address,
-        }))
-    );
-    assert_eq!(&data, b"queued");
-    readiness.assert_no_pending_publish_failure();
-    assert_eq!(provider.reactor.udp_queued_datagram_count(), 0);
-    assert!(
-        !receiver_process
-            .check_readiness(receiver)
-            .unwrap()
-            .contains(ReadinessFlags::READ)
-    );
-}
-
-#[test]
-fn external_udp_readiness_failure_does_not_fail_shared_reactor() {
-    let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
-    let broker = test_broker_core(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(gateway_udp_policy()),
-        BrokerCoreLimits::new_with_all_limits(4, 0, 2, 2),
-        provider,
-    )
-    .unwrap();
-    let process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
-    let (published, publications) = channel();
-    let (retired, _retirements) = channel();
-    let readiness = Arc::new(FailingReadinessSink {
-        inner: TestReadinessSink { published, retired },
-        fail_next_publish: Mutex::new(None),
-    });
-    let socket = create_udp_socket(&process, readiness.clone());
-    let external = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    external.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
-    let external_address = gateway_address(socket_address_v4(external.local_addr().unwrap()));
-    assert_eq!(
-        send_datagram(
-            &process,
-            socket,
-            b"contact",
-            SendFlags::NONE,
-            Some(external_address),
-        ),
-        Ok(SocketOutcome::Completed(7))
-    );
-    let mut contact = [0; 7];
-    let (_, host_address) = external.recv_from(&mut contact).unwrap();
-    assert_eq!(&contact, b"contact");
-
-    readiness.fail_next_publish_matching(socket, ReadinessFlags::READ, ReadinessFlags::default());
-    external.send_to(b"reply", host_address).unwrap();
-    let deadline = Instant::now() + TEST_TIMEOUT;
-    while !process
-        .check_readiness(socket)
-        .unwrap()
-        .contains(ReadinessFlags::READ)
-    {
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for cached native UDP readiness"
-        );
-        thread::sleep(Duration::from_millis(1));
-    }
-    readiness.wait_for_publish_failure_consumed();
-    readiness.fail_next_publish_matching(socket, ReadinessFlags::default(), ReadinessFlags::READ);
-    let mut reply = [0; 5];
-    assert_eq!(
-        receive_datagram_into(&process, socket, &mut reply, ReceiveFromFlags::NONE,),
-        Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
-            received: 5,
-            datagram_length: 5,
-            source_address: external_address,
-        }))
-    );
-    assert_eq!(&reply, b"reply");
-    readiness.assert_no_pending_publish_failure();
-    assert!(
-        !process
-            .check_readiness(socket)
-            .unwrap()
-            .contains(ReadinessFlags::READ)
-    );
-
-    external.send_to(b"first", host_address).unwrap();
-    external.send_to(b"second", host_address).unwrap();
-    wait_until_ready(&process, &publications, socket, ReadinessFlags::READ);
-    readiness.fail_next_publish_matching(socket, ReadinessFlags::default(), ReadinessFlags::READ);
-    for (index, expected) in [b"first".as_slice(), b"second".as_slice()]
-        .into_iter()
-        .enumerate()
-    {
-        let mut data = [0; 6];
-        assert_eq!(
-            receive_datagram_into(
-                &process,
-                socket,
-                &mut data[..expected.len()],
-                ReceiveFromFlags::NONE,
-            ),
-            Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
-                received: expected.len(),
-                datagram_length: expected.len(),
-                source_address: external_address,
-            }))
-        );
-        assert_eq!(&data[..expected.len()], expected);
-        if index == 0 {
-            assert!(
-                process
-                    .check_readiness(socket)
-                    .unwrap()
-                    .contains(ReadinessFlags::READ)
-            );
-        }
-    }
-    assert!(
-        !process
-            .check_readiness(socket)
-            .unwrap()
-            .contains(ReadinessFlags::READ)
-    );
-    readiness.assert_no_pending_publish_failure();
-}
-
-#[test]
-fn udp_status_publication_failure_still_rearms_native_endpoint() {
-    let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
-    let broker = test_broker_core(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(gateway_udp_policy()),
-        BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
-        provider,
-    )
-    .unwrap();
-    let process = broker
-        .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
-    let (published, publications) = channel();
-    let (retired, _retirements) = channel();
-    let readiness = Arc::new(FailingReadinessSink {
-        inner: TestReadinessSink { published, retired },
-        fail_next_publish: Mutex::new(None),
-    });
-    let socket = create_udp_socket(&process, readiness.clone());
-    let refused = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let refused_address = gateway_address(socket_address_v4(refused.local_addr().unwrap()));
-    drop(refused);
-    assert_eq!(
-        litebox_broker_core::socket::connect(&process, socket, refused_address),
-        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
-    );
-    let local_address = litebox_broker_core::socket::status(&process, socket)
-        .unwrap()
-        .local_address;
-    assert_eq!(
-        send_datagram(&process, socket, b"first", SendFlags::NONE, None),
-        Ok(SocketOutcome::Completed(5))
-    );
-    wait_until_ready(&process, &publications, socket, ReadinessFlags::ERROR);
-
-    readiness.fail_next_publish_matching(socket, ReadinessFlags::default(), ReadinessFlags::ERROR);
-    assert_eq!(
-        litebox_broker_core::socket::status(&process, socket),
-        Ok(SocketStatusResponse {
-            status: SocketConnectionStatus::Connected,
-            local_address,
-            pending_error: Some(SocketError::ConnectionRefused),
-        })
-    );
-    assert!(
-        !process
-            .check_readiness(socket)
-            .unwrap()
-            .contains(ReadinessFlags::ERROR)
-    );
-    readiness.assert_no_pending_publish_failure();
-
-    readiness.fail_next_publish_matching(socket, ReadinessFlags::ERROR, ReadinessFlags::default());
-    assert_eq!(
-        send_datagram(&process, socket, b"second", SendFlags::NONE, None),
-        Ok(SocketOutcome::Completed(6))
-    );
-    let deadline = Instant::now() + TEST_TIMEOUT;
-    while !process
-        .check_readiness(socket)
-        .unwrap()
-        .contains(ReadinessFlags::ERROR)
-    {
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for the rearmed UDP error"
-        );
-        thread::sleep(Duration::from_millis(1));
-    }
-    readiness.wait_for_publish_failure_consumed();
 }
 
 #[test]
@@ -796,6 +518,7 @@ fn reactor_preserves_udp_datagram_semantics() {
             address_family: AddressFamily::Ipv4,
             socket_type: SocketType::Datagram,
             protocol: IpProtocol::Udp,
+            flags: FileOpenFlags::NONE,
         },
         readiness.clone(),
     )
@@ -808,6 +531,7 @@ fn reactor_preserves_udp_datagram_semantics() {
             address_family: AddressFamily::Ipv4,
             socket_type: SocketType::Datagram,
             protocol: IpProtocol::Udp,
+            flags: FileOpenFlags::NONE,
         },
         readiness.clone(),
     )
@@ -818,13 +542,13 @@ fn reactor_preserves_udp_datagram_semantics() {
         shutdown_handle,
         ReadinessFlags::WRITE,
     );
+    // An unconnected socket records a shutdown that fails.
     assert_eq!(
         litebox_broker_core::socket::shutdown(&process, shutdown_handle, ShutdownMode::Both,),
-        Ok(SocketOutcome::Completed(()))
+        Ok(SocketOutcome::Failed(SocketError::NotConnected))
     );
     let shutdown_readiness = process.check_readiness(shutdown_handle).unwrap();
-    assert!(shutdown_readiness.contains(ReadinessFlags::READ));
-    assert!(!shutdown_readiness.contains(ReadinessFlags::WRITE));
+    assert!(shutdown_readiness.contains(ReadinessFlags::READ | ReadinessFlags::WRITE));
     assert_eq!(
         send_datagram(
             &process,
@@ -833,7 +557,7 @@ fn reactor_preserves_udp_datagram_semantics() {
             SendFlags::NONE,
             Some(server_address),
         ),
-        Ok(SocketOutcome::Failed(SocketError::Other))
+        Ok(SocketOutcome::Failed(SocketError::Shutdown))
     );
     let mut shutdown_data = [0; 1];
     assert_eq!(
@@ -843,7 +567,7 @@ fn reactor_preserves_udp_datagram_semantics() {
             &mut shutdown_data,
             ReceiveFromFlags::NONE,
         ),
-        Ok(SocketOutcome::Failed(SocketError::NotConnected))
+        Ok(SocketOutcome::Failed(SocketError::Shutdown))
     );
     process.close_object_reference(shutdown_handle).unwrap();
     assert_eq!(
@@ -866,7 +590,7 @@ fn reactor_preserves_udp_datagram_semantics() {
     assert_eq!(&before_shutdown, b"before shutdown");
     assert_eq!(
         litebox_broker_core::socket::shutdown(&process, read_shutdown_handle, ShutdownMode::Read,),
-        Ok(SocketOutcome::Completed(()))
+        Ok(SocketOutcome::Failed(SocketError::NotConnected))
     );
     assert_eq!(
         send_datagram(
@@ -890,7 +614,7 @@ fn reactor_preserves_udp_datagram_semantics() {
             &mut shutdown_data,
             ReceiveFromFlags::NONE,
         ),
-        Ok(SocketOutcome::Failed(SocketError::NotConnected))
+        Ok(SocketOutcome::Failed(SocketError::Shutdown))
     );
     process
         .close_object_reference(read_shutdown_handle)
@@ -1054,7 +778,8 @@ fn reactor_preserves_udp_datagram_semantics() {
         send_datagram(&process, handle, b"refused", SendFlags::NONE, None,),
         Ok(SocketOutcome::Completed(7))
     );
-    wait_until_ready(&process, &publications, handle, ReadinessFlags::ERROR);
+    // Leave the error with the transport so that the failed send queues it.
+    wait_for_readiness_publication(&publications, handle, ReadinessFlags::ERROR);
     assert_eq!(
         send_datagram(
             &process,
@@ -1065,10 +790,9 @@ fn reactor_preserves_udp_datagram_semantics() {
         ),
         Ok(SocketOutcome::Failed(SocketError::InvalidArgument))
     );
-    let send_error_status = litebox_broker_core::socket::status(&process, handle).unwrap();
     assert_eq!(
-        send_error_status.pending_error,
-        Some(SocketError::ConnectionRefused)
+        litebox_broker_core::socket::take_error(&process, handle),
+        Ok(Some(SocketError::ConnectionRefused))
     );
     assert!(
         !process
@@ -1089,10 +813,9 @@ fn reactor_preserves_udp_datagram_semantics() {
         ),
         Ok(SocketOutcome::Failed(SocketError::InvalidArgument))
     );
-    let refused_status = litebox_broker_core::socket::status(&process, handle).unwrap();
     assert_eq!(
-        refused_status.pending_error,
-        Some(SocketError::ConnectionRefused)
+        litebox_broker_core::socket::take_error(&process, handle),
+        Ok(Some(SocketError::ConnectionRefused))
     );
     assert!(
         !process
@@ -1113,15 +836,16 @@ fn reactor_preserves_udp_datagram_semantics() {
         litebox_broker_core::socket::connect(&process, handle, server_address),
         Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
     );
+    // A socket shut down for writing is writable.
     assert!(
-        !process
+        process
             .check_readiness(handle)
             .unwrap()
             .contains(ReadinessFlags::WRITE)
     );
     assert_eq!(
         send_datagram(&process, handle, b"after shutdown", SendFlags::NONE, None,),
-        Ok(SocketOutcome::Failed(SocketError::Other))
+        Ok(SocketOutcome::Failed(SocketError::Shutdown))
     );
 
     process.close_object_reference(handle).unwrap();
@@ -1181,7 +905,7 @@ fn guest_udp_namespace_routes_across_processes_and_filters_private_endpoints() {
             SendFlags::NONE,
             Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, guest_port)),
         ),
-        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+        Ok(SocketOutcome::Completed(12))
     );
     let unbound_private_port = if guest_port == u16::MAX {
         guest_port - 1
@@ -1196,7 +920,7 @@ fn guest_udp_namespace_routes_across_processes_and_filters_private_endpoints() {
             SendFlags::NONE,
             Some(SocketAddrV4::new(GUEST_IPV4_ADDRESS, unbound_private_port,)),
         ),
-        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+        Ok(SocketOutcome::Completed(12))
     );
     assert_eq!(provider.reactor.udp_native_endpoint_count(), 0);
     assert_eq!(
@@ -1314,7 +1038,7 @@ fn guest_udp_namespace_routes_across_processes_and_filters_private_endpoints() {
             SendFlags::NONE,
             Some(receiver_private_address),
         ),
-        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+        Ok(SocketOutcome::Completed(7))
     );
     let receiver_private_alias =
         SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 3), receiver_source.port());
@@ -1326,7 +1050,7 @@ fn guest_udp_namespace_routes_across_processes_and_filters_private_endpoints() {
             SendFlags::NONE,
             Some(receiver_private_alias),
         ),
-        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+        Ok(SocketOutcome::Completed(13))
     );
     external.send_to(b"reply", receiver_source).unwrap();
     wait_until_ready(
@@ -1936,7 +1660,7 @@ fn udp_queued_datagrams_survive_source_process_teardown() {
 }
 
 #[test]
-fn connected_guest_udp_enforces_barriers_peek_and_peer_generations() {
+fn connected_guest_udp_enforces_barriers_peek_and_peer_addresses() {
     let provider = Arc::new(LinuxSocketProvider::new(4, 2).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
@@ -2056,15 +1780,45 @@ fn connected_guest_udp_enforces_barriers_peek_and_peer_generations() {
     assert_eq!(&second_payload, b"two");
 
     second_process.close_object_reference(second).unwrap();
+    assert_eq!(
+        send_datagram(&first_process, first, b"lost", SendFlags::NONE, None),
+        Ok(SocketOutcome::Completed(4))
+    );
+    assert_eq!(
+        send_datagram(&first_process, first, b"refused", SendFlags::NONE, None),
+        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+    );
     let replacement = create_udp_socket(&second_process, readiness);
     assert_eq!(
         litebox_broker_core::socket::bind(&second_process, replacement, second_address),
         Ok(SocketOutcome::Completed(second_address))
     );
+    // The peer is an address, so its new owner receives the connected traffic.
     assert_eq!(
-        send_datagram(&first_process, first, b"stale peer", SendFlags::NONE, None),
-        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+        send_datagram(&first_process, first, b"new owner", SendFlags::NONE, None),
+        Ok(SocketOutcome::Completed(9))
     );
+    wait_until_ready(
+        &second_process,
+        &publications,
+        replacement,
+        ReadinessFlags::READ,
+    );
+    let mut new_owner_payload = [0; 9];
+    assert_eq!(
+        receive_datagram_into(
+            &second_process,
+            replacement,
+            &mut new_owner_payload,
+            ReceiveFromFlags::NONE,
+        ),
+        Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+            received: 9,
+            datagram_length: 9,
+            source_address: first_address,
+        }))
+    );
+    assert_eq!(&new_owner_payload, b"new owner");
 }
 
 #[test]
@@ -2144,6 +1898,20 @@ fn connected_guest_udp_filters_other_wildcard_peer_aliases() {
         }))
     );
     assert_eq!(&payload[..9], b"connected");
+
+    // A bound port whose socket rejects the source is still unreachable.
+    assert_eq!(
+        litebox_broker_core::socket::connect(&process, sender, private_receiver),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+    );
+    assert_eq!(
+        send_datagram(&process, sender, b"wrong alias", SendFlags::NONE, None),
+        Ok(SocketOutcome::Completed(11))
+    );
+    assert_eq!(
+        send_datagram(&process, sender, b"wrong alias", SendFlags::NONE, None),
+        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+    );
 }
 
 #[test]

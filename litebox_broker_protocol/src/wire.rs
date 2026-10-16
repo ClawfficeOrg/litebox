@@ -665,14 +665,15 @@ mod tests {
     };
     use crate::socket::{
         AcceptSocketRequest, AcceptSocketResponse, AddressFamily, BindSocketRequest,
-        BindSocketResponse, ConnectSocketRequest, ConnectSocketResponse, CreateSocketRequest,
-        CreateSocketResponse, GetTcpOptionRequest, GetTcpOptionResponse, IpProtocol,
-        ListenSocketRequest, ListenSocketResponse, ReceiveFlags, ReceiveFromFlags,
-        ReceiveFromSocketRequest, ReceiveFromSocketResponse, ReceiveSocketRequest,
-        ReceiveSocketResponse, SendFlags, SendSocketRequest, SendSocketResponse,
-        SendToSocketRequest, SendToSocketResponse, SetTcpOptionRequest, ShutdownMode,
-        ShutdownSocketRequest, SocketConnectionStatus, SocketError, SocketStatusRequest,
-        SocketStatusResponse, SocketType, TcpOptionName, TcpOptionValue,
+        BindSocketResponse, CheckConnectSocketRequest, ConnectSocketRequest, ConnectSocketResponse,
+        CreateSocketRequest, CreateSocketResponse, GetSocketNameRequest, GetSocketNameResponse,
+        GetSocketOptionRequest, GetSocketOptionResponse, IpProtocol, ListenSocketRequest,
+        ListenSocketResponse, ReceiveFlags, ReceiveFromFlags, ReceiveFromSocketRequest,
+        ReceiveFromSocketResponse, ReceiveSocketRequest, ReceiveSocketResponse, SendFlags,
+        SendSocketRequest, SendSocketResponse, SendToSocketRequest, SendToSocketResponse,
+        SetSocketErrorRequest, SetSocketOptionRequest, ShutdownMode, ShutdownSocketRequest,
+        SocketConnectionStatus, SocketError, SocketOptionName, SocketOptionValue, SocketType,
+        TakeSocketErrorRequest, TakeSocketErrorResponse,
     };
     use crate::timer::{
         CreateTimerRequest, CreateTimerResponse, GetTimerRequest, GetTimerResponse,
@@ -685,7 +686,7 @@ mod tests {
         GetUnixSocketOptionRequest, GetUnixSocketOptionResponse, ListenUnixSocketRequest,
         ReceiveUnixSocketRequest, ReceiveUnixSocketResponse, SendUnixSocketRequest,
         SendUnixSocketResponse, SetUnixSocketOptionRequest, ShutdownUnixSocketRequest,
-        UnixSocketError, UnixSocketOptionName, UnixSocketOptionValue,
+        UnixSocketError,
     };
     use crate::{
         ObjectHandle, ProcessGroupId, ProcessId, ProtocolVersion, RequestId, SessionId, ThreadId,
@@ -705,14 +706,6 @@ mod tests {
 
     fn sequence(slot_index: u32, length: u32) -> SharedBufferSequence {
         SharedBufferSequence::new(&[SharedBufferSlotIndex(slot_index)], length).unwrap()
-    }
-
-    const fn socket_status(status: SocketConnectionStatus) -> SocketStatusResponse {
-        SocketStatusResponse {
-            status,
-            local_address: None,
-            pending_error: None,
-        }
     }
 
     #[test]
@@ -977,11 +970,13 @@ mod tests {
                 address_family: AddressFamily::Ipv4,
                 socket_type: SocketType::Stream,
                 protocol: IpProtocol::Tcp,
+                flags: FileOpenFlags::NONE,
             })),
             BrokerOperation::Socket(SocketRequest::Create(CreateSocketRequest {
                 address_family: AddressFamily::Ipv4,
                 socket_type: SocketType::Datagram,
                 protocol: IpProtocol::Udp,
+                flags: FileOpenFlags::NONBLOCKING,
             })),
             BrokerOperation::Socket(SocketRequest::Bind(BindSocketRequest {
                 handle,
@@ -991,7 +986,10 @@ mod tests {
                 handle,
                 backlog: 4096,
             })),
-            BrokerOperation::Socket(SocketRequest::Accept(AcceptSocketRequest { handle })),
+            BrokerOperation::Socket(SocketRequest::Accept(AcceptSocketRequest {
+                handle,
+                flags: FileOpenFlags::NONBLOCKING,
+            })),
             BrokerOperation::Socket(SocketRequest::Connect(ConnectSocketRequest {
                 handle,
                 address: SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 443),
@@ -1058,23 +1056,46 @@ mod tests {
                 handle,
                 mode: ShutdownMode::StopListening,
             })),
-            BrokerOperation::Socket(SocketRequest::SetTcpOption(SetTcpOptionRequest {
+            BrokerOperation::Socket(SocketRequest::SetOption(SetSocketOptionRequest {
                 handle,
-                value: TcpOptionValue::NoDelay(true),
+                value: SocketOptionValue::NoDelay(true),
             })),
-            BrokerOperation::Socket(SocketRequest::SetTcpOption(SetTcpOptionRequest {
+            BrokerOperation::Socket(SocketRequest::SetOption(SetSocketOptionRequest {
                 handle,
-                value: TcpOptionValue::KeepAlive(false),
+                value: SocketOptionValue::KeepAlive(false),
             })),
-            BrokerOperation::Socket(SocketRequest::GetTcpOption(GetTcpOptionRequest {
+            BrokerOperation::Socket(SocketRequest::SetOption(SetSocketOptionRequest {
                 handle,
-                name: TcpOptionName::NoDelay,
+                value: SocketOptionValue::ReceiveTimeout(Some(core::time::Duration::new(3, 4))),
             })),
-            BrokerOperation::Socket(SocketRequest::GetTcpOption(GetTcpOptionRequest {
+            BrokerOperation::Socket(SocketRequest::SetOption(SetSocketOptionRequest {
                 handle,
-                name: TcpOptionName::KeepAlive,
+                value: SocketOptionValue::Linger(None),
             })),
-            BrokerOperation::Socket(SocketRequest::Status(SocketStatusRequest { handle })),
+            BrokerOperation::Socket(SocketRequest::GetOption(GetSocketOptionRequest {
+                handle,
+                name: SocketOptionName::NoDelay,
+            })),
+            BrokerOperation::Socket(SocketRequest::GetOption(GetSocketOptionRequest {
+                handle,
+                name: SocketOptionName::SendTimeout,
+            })),
+            BrokerOperation::Socket(SocketRequest::CheckConnect(CheckConnectSocketRequest {
+                handle,
+            })),
+            BrokerOperation::Socket(SocketRequest::GetName(GetSocketNameRequest {
+                handle,
+                peer: false,
+            })),
+            BrokerOperation::Socket(SocketRequest::GetName(GetSocketNameRequest {
+                handle,
+                peer: true,
+            })),
+            BrokerOperation::Socket(SocketRequest::TakeError(TakeSocketErrorRequest { handle })),
+            BrokerOperation::Socket(SocketRequest::SetError(SetSocketErrorRequest {
+                handle,
+                error: SocketError::ConnectionReset,
+            })),
             BrokerOperation::Thread(ThreadRequest::Create),
             BrokerOperation::Thread(ThreadRequest::Exit(thread_id(u32::MAX))),
             BrokerOperation::Process(ProcessRequest::AllocateChild),
@@ -1183,22 +1204,22 @@ mod tests {
             })),
             BrokerOperation::UnixSocket(UnixSocketRequest::SetOption(SetUnixSocketOptionRequest {
                 handle,
-                value: UnixSocketOptionValue::ReceiveTimeout(Some(core::time::Duration::new(
+                value: SocketOptionValue::ReceiveTimeout(Some(core::time::Duration::new(
                     u64::MAX,
                     999_999_999,
                 ))),
             })),
             BrokerOperation::UnixSocket(UnixSocketRequest::SetOption(SetUnixSocketOptionRequest {
                 handle,
-                value: UnixSocketOptionValue::Linger(None),
+                value: SocketOptionValue::Linger(None),
             })),
             BrokerOperation::UnixSocket(UnixSocketRequest::SetOption(SetUnixSocketOptionRequest {
                 handle,
-                value: UnixSocketOptionValue::Broadcast(true),
+                value: SocketOptionValue::Broadcast(true),
             })),
             BrokerOperation::UnixSocket(UnixSocketRequest::GetOption(GetUnixSocketOptionRequest {
                 handle,
-                name: UnixSocketOptionName::SendTimeout,
+                name: SocketOptionName::SendTimeout,
             })),
         ];
         let mut maximum_encoded_size = 0;
@@ -1288,13 +1309,20 @@ mod tests {
             SocketError::Other,
             SocketError::NotConnected,
             SocketError::InvalidArgument,
+            SocketError::AlreadyConnected,
+            SocketError::AlreadyInProgress,
+            SocketError::Shutdown,
+            SocketError::DestinationAddressRequired,
+            SocketError::Listening,
+            SocketError::ResourceExhausted,
+            SocketError::UnsupportedOperation,
         ] {
             for socket_response in [
                 SocketResponse::Failed(error),
                 SocketResponse::Connect(ConnectSocketResponse {
                     status: SocketConnectionStatus::Failed(error),
                 }),
-                SocketResponse::Status(socket_status(SocketConnectionStatus::Failed(error))),
+                SocketResponse::TakeError(TakeSocketErrorResponse { error: Some(error) }),
             ] {
                 let response = BrokerResponse {
                     request_id: TEST_REQUEST_ID,
@@ -1467,13 +1495,13 @@ mod tests {
             })),
             BrokerResult::UnixSocket(UnixSocketResponse::SetOption),
             BrokerResult::UnixSocket(UnixSocketResponse::GetOption(GetUnixSocketOptionResponse {
-                value: UnixSocketOptionValue::ReceiveTimeout(Some(core::time::Duration::new(
+                value: SocketOptionValue::ReceiveTimeout(Some(core::time::Duration::new(
                     u64::MAX,
                     1,
                 ))),
             })),
             BrokerResult::UnixSocket(UnixSocketResponse::GetOption(GetUnixSocketOptionResponse {
-                value: UnixSocketOptionValue::KeepAlive(false),
+                value: SocketOptionValue::KeepAlive(false),
             })),
             BrokerResult::UnixSocket(UnixSocketResponse::Failed(UnixSocketError::AddressInUse)),
             BrokerResult::UnixSocket(UnixSocketResponse::Failed(UnixSocketError::NotPermitted)),
@@ -1527,9 +1555,9 @@ mod tests {
                 local_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152),
                 remote_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49153),
             })),
-            BrokerResult::Socket(SocketResponse::Status(socket_status(
-                SocketConnectionStatus::Unconnected,
-            ))),
+            BrokerResult::Socket(SocketResponse::CheckConnect(ConnectSocketResponse {
+                status: SocketConnectionStatus::Unconnected,
+            })),
             BrokerResult::Socket(SocketResponse::Connect(ConnectSocketResponse {
                 status: SocketConnectionStatus::Connecting,
             })),
@@ -1555,27 +1583,32 @@ mod tests {
                 source_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49153),
             })),
             BrokerResult::Socket(SocketResponse::Shutdown),
-            BrokerResult::Socket(SocketResponse::SetTcpOption),
-            BrokerResult::Socket(SocketResponse::GetTcpOption(GetTcpOptionResponse {
-                value: TcpOptionValue::NoDelay(true),
+            BrokerResult::Socket(SocketResponse::SetOption),
+            BrokerResult::Socket(SocketResponse::GetOption(GetSocketOptionResponse {
+                value: SocketOptionValue::NoDelay(true),
             })),
-            BrokerResult::Socket(SocketResponse::GetTcpOption(GetTcpOptionResponse {
-                value: TcpOptionValue::KeepAlive(false),
+            BrokerResult::Socket(SocketResponse::GetOption(GetSocketOptionResponse {
+                value: SocketOptionValue::SendTimeout(Some(core::time::Duration::new(5, 6))),
             })),
-            BrokerResult::Socket(SocketResponse::Status(socket_status(
-                SocketConnectionStatus::Connecting,
-            ))),
-            BrokerResult::Socket(SocketResponse::Status(socket_status(
-                SocketConnectionStatus::Connected,
-            ))),
-            BrokerResult::Socket(SocketResponse::Status(SocketStatusResponse {
+            BrokerResult::Socket(SocketResponse::CheckConnect(ConnectSocketResponse {
+                status: SocketConnectionStatus::Connecting,
+            })),
+            BrokerResult::Socket(SocketResponse::CheckConnect(ConnectSocketResponse {
                 status: SocketConnectionStatus::Connected,
-                local_address: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152)),
-                pending_error: Some(SocketError::ConnectionReset),
             })),
-            BrokerResult::Socket(SocketResponse::Status(socket_status(
-                SocketConnectionStatus::Failed(SocketError::TimedOut),
-            ))),
+            BrokerResult::Socket(SocketResponse::GetName(GetSocketNameResponse {
+                address: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152)),
+            })),
+            BrokerResult::Socket(SocketResponse::GetName(GetSocketNameResponse {
+                address: None,
+            })),
+            BrokerResult::Socket(SocketResponse::TakeError(TakeSocketErrorResponse {
+                error: Some(SocketError::ConnectionReset),
+            })),
+            BrokerResult::Socket(SocketResponse::TakeError(TakeSocketErrorResponse {
+                error: None,
+            })),
+            BrokerResult::Socket(SocketResponse::SetError),
             BrokerResult::Socket(SocketResponse::Failed(SocketError::ConnectionReset)),
             BrokerResult::RandomFilled,
             BrokerResult::File(FileResponse::Open(OpenFileResponse { handle })),
@@ -2157,17 +2190,19 @@ mod tests {
             Err(WireError::TruncatedFrame)
         );
 
-        // Address family, type, and protocol are the last three bytes of a
-        // create frame, so each unknown tag is rejected on its own.
+        // Address family, type, and protocol precede the two-byte status flags
+        // at the end of a create frame, so each unknown tag, and unknown flag
+        // bits, are rejected on their own.
         let create = encode_request(BrokerRequest {
             request_id: TEST_REQUEST_ID,
             operation: BrokerOperation::Socket(SocketRequest::Create(CreateSocketRequest {
                 address_family: AddressFamily::Ipv4,
                 socket_type: SocketType::Stream,
                 protocol: IpProtocol::Tcp,
+                flags: FileOpenFlags::NONE,
             })),
         });
-        for offset in 1..=3 {
+        for offset in [1, 3, 4, 5] {
             let mut frame = create.clone();
             let index = frame.len() - offset;
             frame[index] = 0xff;
@@ -2178,15 +2213,15 @@ mod tests {
             Err(WireError::TruncatedFrame)
         );
 
-        let set_tcp_option = encode_request(BrokerRequest {
+        let set_option = encode_request(BrokerRequest {
             request_id: TEST_REQUEST_ID,
-            operation: BrokerOperation::Socket(SocketRequest::SetTcpOption(SetTcpOptionRequest {
+            operation: BrokerOperation::Socket(SocketRequest::SetOption(SetSocketOptionRequest {
                 handle: ObjectHandle(13),
-                value: TcpOptionValue::NoDelay(true),
+                value: SocketOptionValue::NoDelay(true),
             })),
         });
         for offset in 1..=2 {
-            let mut frame = set_tcp_option.clone();
+            let mut frame = set_option.clone();
             let index = frame.len() - offset;
             frame[index] = 0xff;
             assert_eq!(decode_request(&frame), Err(WireError::InvalidTag));
@@ -2263,25 +2298,26 @@ mod tests {
             Err(WireError::InvalidTag)
         );
 
-        let mut unknown_status = encode_response(BrokerResponse {
+        let mut unknown_optional_error = encode_response(BrokerResponse {
             request_id: TEST_REQUEST_ID,
-            result: BrokerResult::Socket(SocketResponse::Status(SocketStatusResponse {
-                status: SocketConnectionStatus::Connected,
-                local_address: None,
-                pending_error: None,
+            result: BrokerResult::Socket(SocketResponse::TakeError(TakeSocketErrorResponse {
+                error: None,
             })),
         });
-        *unknown_status.last_mut().unwrap() = 0xff;
-        assert_eq!(decode_response(&unknown_status), Err(WireError::InvalidTag));
+        *unknown_optional_error.last_mut().unwrap() = 0xff;
+        assert_eq!(
+            decode_response(&unknown_optional_error),
+            Err(WireError::InvalidTag)
+        );
 
-        let get_tcp_option = encode_response(BrokerResponse {
+        let get_option = encode_response(BrokerResponse {
             request_id: TEST_REQUEST_ID,
-            result: BrokerResult::Socket(SocketResponse::GetTcpOption(GetTcpOptionResponse {
-                value: TcpOptionValue::KeepAlive(true),
+            result: BrokerResult::Socket(SocketResponse::GetOption(GetSocketOptionResponse {
+                value: SocketOptionValue::KeepAlive(true),
             })),
         });
         for offset in 1..=2 {
-            let mut frame = get_tcp_option.clone();
+            let mut frame = get_option.clone();
             let index = frame.len() - offset;
             frame[index] = 0xff;
             assert_eq!(decode_response(&frame), Err(WireError::InvalidTag));
@@ -2291,7 +2327,7 @@ mod tests {
             request_id: TEST_REQUEST_ID,
             result: BrokerResult::Socket(SocketResponse::Failed(SocketError::TimedOut)),
         });
-        for raw in [0, 13, u8::MAX] {
+        for raw in [0, 20, u8::MAX] {
             let mut unknown_socket_error = socket_error.clone();
             *unknown_socket_error.last_mut().unwrap() = raw;
             assert_eq!(
@@ -2638,9 +2674,10 @@ mod tests {
                 request_id: RequestId(13),
                 operation: BrokerOperation::Socket(SocketRequest::Accept(AcceptSocketRequest {
                     handle: ObjectHandle(9),
+                    flags: FileOpenFlags::NONBLOCKING,
                 })),
             }),
-            [5, 13, 0, 0, 0, 0, 0, 0, 0, 9, 9, 0, 0, 0, 0, 0, 0, 0]
+            [5, 13, 0, 0, 0, 0, 0, 0, 0, 4, 9, 0, 0, 0, 0, 0, 0, 0, 32, 0]
         );
     }
 
@@ -2657,7 +2694,7 @@ mod tests {
                 })),
             }),
             [
-                5, 13, 0, 0, 0, 0, 0, 0, 0, 10, 9, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0, 0, 0, 3, 0, 0, 0,
+                5, 13, 0, 0, 0, 0, 0, 0, 0, 6, 9, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0, 0, 0, 3, 0, 0, 0,
                 0, 0, 0, 0, 1, 203, 0, 113, 7, 53, 0
             ]
         );
@@ -2670,7 +2707,7 @@ mod tests {
                 request_id: RequestId(13),
                 result: BrokerResult::Socket(SocketResponse::Failed(SocketError::ConnectionReset,)),
             }),
-            [5, 13, 0, 0, 0, 0, 0, 0, 0, 6, 2]
+            [5, 13, 0, 0, 0, 0, 0, 0, 0, 16, 2]
         );
     }
 
@@ -2686,7 +2723,7 @@ mod tests {
                 })),
             }),
             [
-                5, 13, 0, 0, 0, 0, 0, 0, 0, 9, 9, 0, 0, 0, 0, 0, 0, 0, 127, 0, 0, 1, 0, 192, 203,
+                5, 13, 0, 0, 0, 0, 0, 0, 0, 4, 9, 0, 0, 0, 0, 0, 0, 0, 127, 0, 0, 1, 0, 192, 203,
                 0, 113, 7, 187, 1,
             ]
         );
