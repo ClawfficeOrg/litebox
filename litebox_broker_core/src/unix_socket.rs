@@ -1248,11 +1248,14 @@ impl Socket {
             let mut data = Vec::new();
             data.try_reserve_exact(length)
                 .map_err(|_| BrokerError::OutOfMemory)?;
+            let (front, back) = channel.queue.bytes.as_slices();
+            let from_front = length.min(front.len());
+            data.extend_from_slice(&front[..from_front]);
+            data.extend_from_slice(&back[..length - from_front]);
             if peek {
-                data.extend(channel.queue.bytes.iter().take(length));
                 (data, Wakeups::default())
             } else {
-                data.extend(channel.queue.bytes.drain(..length));
+                channel.queue.bytes.drain(..length);
                 if channel.queue.bytes.is_empty() {
                     channel.queue.bytes = VecDeque::new();
                 }

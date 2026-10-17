@@ -154,7 +154,11 @@ impl PipeObject {
         let mut data = Vec::new();
         data.try_reserve_exact(read_len)
             .map_err(|_| BrokerError::OutOfMemory)?;
-        data.extend(state.data.drain(..read_len));
+        let (front, back) = state.data.as_slices();
+        let from_front = read_len.min(front.len());
+        data.extend_from_slice(&front[..from_front]);
+        data.extend_from_slice(&back[..read_len - from_front]);
+        state.data.drain(..read_len);
         state.publish(PipeEndpoint::Write);
         Ok(data)
     }
@@ -318,5 +322,31 @@ impl PipeState {
                 readiness
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TestBrokerCoreBuilder;
+    use crate::{CallerCredential, PolicyEngine};
+    use std::vec;
+
+    #[test]
+    fn reads_take_data_that_wraps_around_the_buffer() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        let (reader, writer) = create(&process, 8, 1, FileOpenFlags::NONE).unwrap();
+        assert_eq!(write(&process, writer, &[0, 1, 2, 3, 4, 5]), Ok(6));
+        assert_eq!(read(&process, reader, 4), Ok(vec![0, 1, 2, 3]));
+        // The buffer holds exactly the capacity, so this wraps around its end.
+        assert_eq!(write(&process, writer, &[6, 7, 8, 9]), Ok(4));
+        assert_eq!(read(&process, reader, 8), Ok(vec![4, 5, 6, 7, 8, 9]));
     }
 }
