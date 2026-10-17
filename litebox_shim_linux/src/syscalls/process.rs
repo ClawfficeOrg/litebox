@@ -2597,7 +2597,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         for _ in 0..SHEBANG_MAX_RECURSION {
             let full_path = self.resolve_path(&path)?;
             let file = self.do_open(
-                full_path,
+                &full_path,
                 litebox_common_linux::OFlags::RDONLY,
                 litebox_broker_protocol::fs::FileMode::empty(),
             )?;
@@ -2638,10 +2638,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         ctx: &mut litebox_common_linux::PtRegs,
     ) -> Result<usize, Errno> {
         // The fresh runner needs an absolute path; resolve it against this task's cwd.
-        let path = self
-            .resolve_path(path.as_str())?
-            .into_string()
-            .map_err(|_| Errno::EINVAL)?;
+        let path = self.resolve_path(path.as_str())?;
         let (inherited_fds, fds): (alloc::vec::Vec<_>, alloc::vec::Vec<_>) =
             self.fds_inherited_across_exec()?.into_iter().unzip();
         let fs = self.fs.borrow();
