@@ -1,0 +1,50 @@
+{
+  "repository": "https://github.com/google/gvisor.git",
+  "revision": "a4d9fdee9d4bb6fbc7790319a91862d716bbbdfc",
+  "bazel_version": "8.8.1",
+  "tests": [
+    {
+      "binary": "dup_test",
+      "cases": [
+        "DupTest.Dup",
+        "DupTest.DupClearsCloExec",
+        "DupTest.DupWithOpath",
+        "DupTest.Dup2",
+        "DupTest.Rlimit",
+        "DupTest.Dup2SameFD",
+        "DupTest.Dup2WithOpath",
+        "DupTest.Dup3",
+        "DupTest.Dup3FailsSameFD",
+        "DupTest.Dup3WithOpath"
+      ],
+      "excluded": {
+        "RlimitTest.DupLimitedByNROpenSysctl": "Requires CAP_SYS_RESOURCE and changes the host-wide /proc/sys/fs/nr_open setting; never run in this unprivileged subset."
+      }
+    },
+    {
+      "binary": "eventfd_test",
+      "cases": [
+        "EventfdTest.Nonblock",
+        "EventfdTest.BlockingWrite",
+        "EventfdTest.SmallWrite",
+        "EventfdTest.SmallRead",
+        "EventfdTest.IllegalPread",
+        "EventfdTest.IllegalPwrite",
+        "EventfdTest.BigWriteFails",
+        "EventfdTest.BigRead",
+        "EventfdTest.NotifyNonZero"
+      ],
+      "excluded": {
+        "EventfdTest.IllegalSeek": "Upstream explicitly skips native Linux because its expected behavior is gVisor-specific.",
+        "EventfdTest.SpliceReturnsEINVAL": "Upstream explicitly skips native Linux; not a native-versus-LiteBox comparison."
+      }
+    },
+    {
+      "binary": "brk_test",
+      "cases": [
+        "BrkTest.BrkSyscallReturnsOldBrkOnFailure"
+      ],
+      "excluded": {}
+    }
+  ]
+}

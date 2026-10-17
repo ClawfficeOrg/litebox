@@ -1,0 +1,50 @@
+name: Linux compatibility baseline
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gvisor:
+    name: gVisor syscall subset (x86-64 Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out LiteBox
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+      - name: Set up Rust
+        run: |
+          rustup toolchain install "$(awk -F'"' '/channel/{print $2}' rust-toolchain.toml)" \
+            --profile minimal --no-self-update --target x86_64-unknown-linux-gnu
+      - name: Set up Bazelisk
+        uses: bazel-contrib/setup-bazel@104e3eea9447cdaa4b00d0fb46191a3985d26ab3 # v0.19.1
+      - name: Test the harness
+        run: python3 -m unittest discover -s dev_tests/linux_compat -p 'test_*.py' -v
+      - name: Compare native Linux and LiteBox
+        run: python3 dev_tests/linux_compat/run.py
+      - name: Publish comparison summary
+        if: always()
+        run: |
+          if [ -d target/linux-compat ]; then
+            find target/linux-compat -maxdepth 2 -name summary.md -type f \
+              -exec cat {} \; >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No compatibility report was produced." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload reports and logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux-compat-gvisor
+          if-no-files-found: warn
+          path: |
+            target/linux-compat/run-*/results.json
+            target/linux-compat/run-*/summary.md
+            target/linux-compat/run-*/**/*.log
+            target/linux-compat/run-*/**/process.json
