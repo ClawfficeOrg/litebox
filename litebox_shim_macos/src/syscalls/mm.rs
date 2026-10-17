@@ -9,6 +9,7 @@
 
 use alloc::{collections::BTreeSet, sync::Arc, vec, vec::Vec};
 use core::ops::Range;
+use litebox::mm::page::{NonZeroAddress, NonZeroPageSize};
 use litebox::{
     fs::errors::ReadError,
     platform::{
@@ -17,9 +18,7 @@ use litebox::{
     },
     utils::TruncateExt as _,
 };
-use litebox_common_linux::vmem::{
-    CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, VmFlags, VmemProtectError,
-};
+use litebox_common_linux::vmem::{CreatePagesFlags, MappingError, VmFlags, VmemProtectError};
 use litebox_common_macos::{
     MmapFlags, PAGE_SIZE, VmProtection, errno::Errno, loader::MAX_IMAGE_SIZE,
 };
@@ -1340,8 +1339,8 @@ mod tests {
     use litebox_broker_host::test_support::InProcessBrokerSetup;
     use litebox_broker_local::BrokerLocal;
     use litebox_broker_protocol::fs::{FileAccessMode, FileMode, FileOpenFlags, FileUser};
-    use litebox_common_linux::vmem::VmFlags;
-    use litebox_common_macos::{PtRegs, TaskParams, syscall::nr, user_pointers::UserPtr};
+    use litebox_common_linux::{PtRegs, vmem::VmFlags};
+    use litebox_common_macos::{TaskParams, syscall::nr, user_pointers::UserPtr};
     use litebox_platform_macos_userland::MacosUserland as Platform;
     use litebox_syscall_rewriter::aarch64::{GateMetadata, decode_branch_target};
 
