@@ -11,6 +11,11 @@ use anyhow::{Result, anyhow};
 use clap::Parser;
 use litebox_platform_windows_userland::WindowsUserland as Platform;
 use std::path::PathBuf;
+use std::sync::Arc;
+
+/// Syscall observation types, re-exported so that an embedder (for example a tool that re-executes
+/// itself as the runner) can implement an observer without depending on the shim crate directly.
+pub use litebox_shim_linux::observer::{SyscallEvent, SyscallObserver};
 
 /// Run Linux programs with LiteBox on unmodified Windows.
 ///
@@ -51,6 +56,23 @@ pub struct CliArgs {
 /// panic. If it does actually panic, then ping the authors of LiteBox, and likely a better error
 /// message could be thrown instead.
 pub fn run(cli_args: CliArgs) -> Result<()> {
+    run_with_observer(cli_args, None)
+}
+
+/// Like [`run`], but with an optional [`SyscallObserver`] that is told about every guest syscall.
+///
+/// This lets an embedder drive the runner from its own `main` (parsing [`CliArgs`] itself or
+/// building them) and watch the guest, without forking this crate. With `None` it behaves exactly
+/// like [`run`]. The observer is called synchronously on guest threads; see
+/// [`litebox_shim_linux::observer`] for the contract.
+///
+/// # Panics
+///
+/// Same as [`run`].
+pub fn run_with_observer(
+    cli_args: CliArgs,
+    syscall_observer: Option<Arc<dyn SyscallObserver>>,
+) -> Result<()> {
     tracing_subscriber::fmt()
         .with_timer(tracing_subscriber::fmt::time::uptime())
         .with_level(true)
@@ -69,7 +91,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         .map_err(|e| anyhow!("Could not read tar file at {}: {}", tar_file.display(), e))?;
 
     let platform = Platform::new();
-    let shim_builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
+    let mut shim_builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
+    if let Some(observer) = syscall_observer {
+        shim_builder = shim_builder.with_syscall_observer(observer);
+    }
 
     // The program path is a Unix-style path inside the tar archive.
     let prog_path = &cli_args.program_and_arguments[0];

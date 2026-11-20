@@ -50,6 +50,7 @@ macro_rules! log_unsupported {
 
 pub(crate) mod channel;
 pub mod loader;
+pub mod observer;
 pub(crate) mod stdio;
 pub mod syscalls;
 pub mod transport;
@@ -321,6 +322,7 @@ impl<Platform: ShimPlatform> LinuxShimEntrypoints<Platform> {
 pub struct LinuxShimBuilder<Platform: ShimPlatform> {
     platform: &'static Platform,
     litebox: LiteBox<Platform>,
+    syscall_observer: Option<Arc<dyn observer::SyscallObserver>>,
 }
 
 impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
@@ -329,7 +331,19 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         Self {
             platform,
             litebox: LiteBox::new(platform),
+            syscall_observer: None,
         }
+    }
+
+    /// Registers an observer that is told about every guest syscall the shim dispatches.
+    ///
+    /// Observation is opt-in: without this call the dispatch path pays one branch per syscall
+    /// and builds no events. Only one observer can be registered; a later call replaces an
+    /// earlier one. See [`observer`] for the calling contract.
+    #[must_use]
+    pub fn with_syscall_observer(mut self, observer: Arc<dyn observer::SyscallObserver>) -> Self {
+        self.syscall_observer = Some(observer);
+        self
     }
 
     /// Returns the litebox object for the shim.
@@ -364,6 +378,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             litebox: self.litebox,
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
             elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
+            syscall_observer: self.syscall_observer,
         });
         LinuxShim(global)
     }
@@ -730,14 +745,64 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// Unsupported syscalls or arguments would trigger a panic for development purposes.
     fn handle_syscall_request(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        // Observation is opt-in. When no observer is set this is the only extra work on the
+        // dispatch path: no event is built and the clock is not read.
+        #[cfg(target_arch = "x86_64")]
+        let observed = self
+            .global
+            .syscall_observer
+            .as_deref()
+            .map(|obs| (obs, self.observe_syscall_enter(obs, ctx)));
         let return_value = match self.do_syscall(ctx) {
             Ok(v) => v,
             Err(err) => (err.as_neg() as isize).reinterpret_as_unsigned(),
         };
         #[cfg(target_arch = "x86_64")]
+        if let Some((obs, mut event)) = observed {
+            event.timestamp = self.syscall_observer_timestamp();
+            obs.on_exit(&event, return_value.reinterpret_as_signed() as i64);
+        }
+        #[cfg(target_arch = "x86_64")]
         {
             ctx.rax = return_value;
         }
+    }
+
+    /// Builds the entry event for the syscall in `ctx` and hands it to `obs`, returning the event
+    /// so that the exit notification can reuse its identity and arguments.
+    #[cfg(target_arch = "x86_64")]
+    #[cold]
+    fn observe_syscall_enter(
+        &self,
+        obs: &dyn observer::SyscallObserver,
+        ctx: &litebox_common_linux::PtRegs,
+    ) -> observer::SyscallEvent {
+        let event = observer::SyscallEvent {
+            pid: self.pid,
+            tid: self.tid,
+            nr: ctx.orig_rax as u64,
+            args: [
+                ctx.rdi as u64,
+                ctx.rsi as u64,
+                ctx.rdx as u64,
+                ctx.r10 as u64,
+                ctx.r8 as u64,
+                ctx.r9 as u64,
+            ],
+            timestamp: self.syscall_observer_timestamp(),
+        };
+        obs.on_enter(&event);
+        event
+    }
+
+    /// Monotonic time since the shim was built, for observer events.
+    #[cfg(target_arch = "x86_64")]
+    fn syscall_observer_timestamp(&self) -> core::time::Duration {
+        use litebox::platform::Instant as _;
+        self.global
+            .platform
+            .now()
+            .duration_since(&self.global.boot_time)
     }
 
     fn do_syscall(&self, ctx: &mut litebox_common_linux::PtRegs) -> Result<usize, Errno> {
@@ -1387,6 +1452,9 @@ struct GlobalState<Platform: ShimPlatform> {
     unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable<Platform>>,
     /// Per-process collection of ELF patching state for runtime syscall rewriting.
     elf_patch_cache: litebox::sync::Mutex<Platform, syscalls::mm::ElfPatchCache<Platform>>,
+    /// Optional syscall observer. Set once at build time and never changed, so checking it on
+    /// the dispatch path is a single predictable branch.
+    syscall_observer: Option<Arc<dyn observer::SyscallObserver>>,
 }
 
 struct Task<Platform: ShimPlatform> {
