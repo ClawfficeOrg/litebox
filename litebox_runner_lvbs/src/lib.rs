@@ -5,19 +5,16 @@
 
 extern crate alloc;
 
-use alloc::{boxed::Box, sync::Arc, vec};
+use alloc::{boxed::Box, vec, vec::Vec};
 use core::panic::PanicInfo;
-use litebox::{
-    platform::RawConstPointer,
-    utils::{ReinterpretSignedExt, TruncateExt},
-};
+use litebox::utils::{ReinterpretSignedExt, TruncateExt};
 use litebox_common_linux::errno::Errno;
 use litebox_common_lvbs::PAGE_SIZE;
 use litebox_common_lvbs::{NUM_VTLCALL_PARAMS, VsmError, VsmFunction};
 use litebox_common_optee::{
     OpteeMessageCommand, OpteeMsgArgs, OpteeMsgParamRmem, OpteeRpcArgs, OpteeRpcCommand,
     OpteeRpcShmType, OpteeSmcArgs, OpteeSmcFunction, OpteeSmcResult, OpteeSmcReturnCode, TeeOrigin,
-    TeeResult, UteeEntryFunc, UteeParams, optee_msg_args_total_size,
+    TeeResult, UteeEntryFunc, optee_msg_args_total_size,
 };
 use litebox_platform_lvbs::host::LvbsLinuxKernel as Platform;
 use litebox_platform_lvbs::mshv::vsm::{LvbsVtl0Gate, LvbsVtl0PrivilegedWriter, LvbsVtl1Gate};
@@ -42,12 +39,12 @@ use litebox_platform_lvbs::{
 use litebox_platform_lvbs::{mshv::vsm_intercept::panic_to_vtl0, serial_println};
 use litebox_shim_optee::ClientPta;
 use litebox_shim_optee::session::{OpenSessionTarget, SessionManager, TaInstance};
-use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr, TaMemrefAddresses, UserConstPtr};
+use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr};
 use litebox_shim_optee::{
     msg_handler::{
-        checked_memref_size, decode_ta_request, handle_optee_msg_args, handle_optee_smc_args,
-        read_optee_msg_args_from_regd_shm, read_rpc_shm, register_rpc_shm, unregister_rpc_shm,
-        update_optee_msg_args, write_rpc_args_to_regd_shm,
+        TaRequestInfo, checked_memref_size, decode_ta_request, handle_optee_msg_args,
+        handle_optee_smc_args, read_optee_msg_args_from_regd_shm, read_rpc_shm, register_rpc_shm,
+        unregister_rpc_shm, update_optee_msg_args, write_rpc_args_to_regd_shm,
     },
     rpc_context::{RpcCompletion, RpcContext, rpc_context_map},
 };
@@ -544,17 +541,6 @@ impl Drop for TaskPageTableGuard {
     }
 }
 
-struct DynamicTaBinaryGuard {
-    shim: litebox_shim_optee::OpteeShim<Platform>,
-    ta_uuid: litebox_common_optee::TeeUuid,
-}
-
-impl Drop for DynamicTaBinaryGuard {
-    fn drop(&mut self) {
-        self.shim.remove_ta_bin(&self.ta_uuid);
-    }
-}
-
 /// Switches to base and unregisters the task table.
 ///
 /// All user-memory accesses on this core must be complete.
@@ -680,7 +666,7 @@ fn optee_smc_handler(platform: &'static Platform, smc_args_addr: usize) -> Optee
                     &mut msg_args,
                     &mut rpc_args,
                     msg_args_phys_addr,
-                    None,
+                    &mut None,
                 ),
                 InvokeCommand => handle_invoke_command(platform, &mut msg_args, msg_args_phys_addr),
                 CloseSession => handle_close_session(platform, &mut msg_args, msg_args_phys_addr),
@@ -814,16 +800,20 @@ fn optee_smc_handler(platform: &'static Platform, smc_args_addr: usize) -> Optee
                 RpcContext::ShmFree {
                     common,
                     shm_ref,
-                    completion,
+                    mut completion,
                 } => {
                     let return_code = handle_return_from_shm_free_rpc(
                         platform,
                         &mut msg_args,
                         &rpc_args,
                         msg_args_phys_addr,
-                        &completion,
+                        &mut completion,
                     );
                     if return_code == OpteeSmcReturnCode::EThreadLimit {
+                        debug_assert!(
+                            !matches!(completion, RpcCompletion::OpenSession { ta_binary: None }),
+                            "EThreadLimit after the TA binary was taken; the retry needs it"
+                        );
                         if rpc_context_map()
                             .insert(
                                 context_id,
@@ -924,10 +914,17 @@ fn handle_return_from_load_ta_binary_rpc(
     let completion = match rpc_args.load_ta_binary_response(shm_ref, requested_size) {
         Ok(rmem) => match checked_memref_size(rmem.size) {
             Ok(ta_size) => {
-                let mut ta_binary = alloc::vec![0u8; ta_size];
-                match read_rpc_shm(platform, rmem.shm_ref, 0, &mut ta_binary) {
+                // `ta_size` is normal-world controlled: allocate fallibly.
+                let mut ta_binary = Vec::new();
+                let read = if ta_binary.try_reserve_exact(ta_size).is_ok() {
+                    ta_binary.resize(ta_size, 0);
+                    read_rpc_shm(platform, rmem.shm_ref, 0, &mut ta_binary)
+                } else {
+                    Err(OpteeSmcReturnCode::ENomem)
+                };
+                match read {
                     Ok(()) => RpcCompletion::OpenSession {
-                        ta_binary: Arc::from(ta_binary),
+                        ta_binary: Some(ta_binary),
                     },
                     Err(error) => RpcCompletion::ReturnError(error),
                 }
@@ -950,7 +947,7 @@ fn handle_return_from_shm_free_rpc(
     msg_args: &mut OpteeMsgArgs,
     rpc_args: &OpteeRpcArgs,
     msg_args_phys_addr: u64,
-    completion: &RpcCompletion,
+    completion: &mut RpcCompletion,
 ) -> OpteeSmcReturnCode {
     if rpc_args.cmd != OpteeRpcCommand::ShmFree
         || rpc_args.ret != TeeResult::Success
@@ -967,7 +964,7 @@ fn handle_return_from_shm_free_rpc(
                 msg_args,
                 &mut no_rpc_args,
                 msg_args_phys_addr,
-                Some(ta_binary.clone()),
+                ta_binary,
             )
             .err()
             .unwrap_or(OpteeSmcReturnCode::Ok)
@@ -1032,9 +1029,9 @@ fn handle_open_session(
     msg_args: &mut OpteeMsgArgs,
     rpc_args: &mut Option<Box<OpteeRpcArgs>>,
     msg_args_phys_addr: u64,
-    ta_binary: Option<Arc<[u8]>>,
+    ta_binary: &mut Option<Vec<u8>>,
 ) -> Result<(), OpteeSmcReturnCode> {
-    let ta_req_info =
+    let mut ta_req_info =
         decode_ta_request(platform, msg_args).map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
     if ta_req_info.entry_func != UteeEntryFunc::OpenSession {
         return Err(OpteeSmcReturnCode::EBadCmd);
@@ -1049,27 +1046,23 @@ fn handle_open_session(
         return write_non_ta_msg_args_to_normal_world(platform, msg_args, msg_args_phys_addr);
     }
 
-    let params = &ta_req_info.params;
-
     session_manager().with_ta(&ta_uuid, |target| match target {
         OpenSessionTarget::Sibling(instance) => open_session_single_instance(
             platform,
             msg_args,
             msg_args_phys_addr,
             instance,
-            params,
             client_identity,
-            &ta_req_info,
+            &mut ta_req_info,
         ),
         OpenSessionTarget::NewInstance => open_session_new_instance(
             platform,
             msg_args,
             msg_args_phys_addr,
             rpc_args,
-            params,
             ta_uuid,
             client_identity,
-            &ta_req_info,
+            &mut ta_req_info,
             ta_binary,
         ),
         OpenSessionTarget::Busy => {
@@ -1095,9 +1088,8 @@ fn open_session_single_instance(
     msg_args: &mut OpteeMsgArgs,
     msg_args_phys_addr: u64,
     instance: &TaInstance<Platform>,
-    params: &[litebox_common_optee::UteeParamOwned],
     client_identity: Option<litebox_common_optee::TeeIdentity>,
-    ta_req_info: &litebox_shim_optee::msg_handler::TaRequestInfo<PAGE_SIZE>,
+    ta_req_info: &mut TaRequestInfo<PAGE_SIZE>,
 ) -> Result<(), OpteeSmcReturnCode> {
     let task_pt_id = instance.task_page_table_id();
     let ta_uuid = instance.uuid();
@@ -1121,18 +1113,13 @@ fn open_session_single_instance(
     let _task_pt_guard = TaskPageTableGuard::enter(platform, task_pt_id)?;
 
     // Load TA context with parameters for OpenSession - pass actual session_id
-    let memref_addresses = instance
+    ta_req_info.session = runner_session_id;
+    instance
         .loaded_program()
         .entrypoints
         .as_ref()
         .ok_or(OpteeSmcReturnCode::EBadCmd)?
-        .load_ta_context_with_shm(
-            params,
-            &ta_req_info.shm_info,
-            runner_session_id,
-            UteeEntryFunc::OpenSession as u32,
-            None,
-        )
+        .load_ta_context(ta_req_info)
         .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
 
     // Run the TA's OpenSession entry point using reference-based reenter
@@ -1143,15 +1130,6 @@ fn open_session_single_instance(
             &mut ctx,
         );
     }
-
-    // Read TA output parameters from the stack buffer
-    let params_address = instance
-        .loaded_program()
-        .params_address
-        .ok_or(OpteeSmcReturnCode::EBadAddr)?;
-    let ta_params = UserConstPtr::<Platform, UteeParams>::from_usize(params_address)
-        .read_at_offset(0)
-        .ok_or(OpteeSmcReturnCode::EBadAddr)?;
 
     // Check the return code from the TA's OpenSession entry point
     let return_code: u32 = ctx.rax.trunc();
@@ -1174,9 +1152,7 @@ fn open_session_single_instance(
             msg_args_phys_addr,
             return_code,
             None, // No session ID on failure
-            Some(&ta_params),
             Some(ta_req_info),
-            Some(&memref_addresses),
         );
 
         // For single-instance TAs, only clean up on TARGET_DEAD (panic).
@@ -1204,9 +1180,7 @@ fn open_session_single_instance(
         msg_args_phys_addr,
         return_code,
         Some(runner_session_id),
-        Some(&ta_params),
         Some(ta_req_info),
-        Some(&memref_addresses),
     );
 
     // Write-back failure: OpenSession succeeded inside the TA, but we cannot
@@ -1254,17 +1228,16 @@ fn open_session_new_instance(
     msg_args: &mut OpteeMsgArgs,
     msg_args_phys_addr: u64,
     rpc_args: &mut Option<Box<OpteeRpcArgs>>,
-    params: &[litebox_common_optee::UteeParamOwned],
     ta_uuid: litebox_common_optee::TeeUuid,
     client_identity: Option<litebox_common_optee::TeeIdentity>,
-    ta_req_info: &litebox_shim_optee::msg_handler::TaRequestInfo<PAGE_SIZE>,
-    ta_binary: Option<Arc<[u8]>>,
+    ta_req_info: &mut TaRequestInfo<PAGE_SIZE>,
+    ta_binary: &mut Option<Vec<u8>>,
 ) -> Result<(), OpteeSmcReturnCode> {
     let shim = litebox_shim_optee::OpteeShimBuilder::new(platform, session_manager())
         .with_ta_signing_cert(TA_SIGNING_CERT_DER)
         .build();
 
-    if ta_binary.is_none() && !shim.contains_ta_bin(&ta_uuid) {
+    if ta_binary.is_none() && !shim.contains_embedded_ta_bin(&ta_uuid) {
         debug_serial_println!(
             "TA binary not found for uuid={:?}, requesting load from normal world",
             ta_uuid
@@ -1314,22 +1287,18 @@ fn open_session_new_instance(
         OpteeSmcReturnCode::ENotAvail
     })?;
 
-    if let Some(ta_binary) = ta_binary
-        && !shim.store_ta_bin(&ta_uuid, &ta_binary)
-    {
-        teardown_ta_page_table(platform, task_pt_id);
-        return Err(OpteeSmcReturnCode::EBadCmd);
-    }
-    let _ta_binary_guard = DynamicTaBinaryGuard {
-        shim: shim.clone(),
-        ta_uuid,
-    };
-
     // Load ldelf and TA - Box immediately to keep at fixed heap address
-    let loaded_program = Box::new(shim.load_ldelf(LDELF_BINARY, ta_uuid).map_err(|_| {
-        teardown_ta_page_table(platform, task_pt_id);
-        OpteeSmcReturnCode::ENomem
-    })?);
+    // Take `ta_binary` only after every `EThreadLimit` source: a retry needs it.
+    let loaded_program = Box::new(
+        shim.load_ldelf(LDELF_BINARY, ta_uuid, ta_binary.take())
+            .map_err(|error| {
+                teardown_ta_page_table(platform, task_pt_id);
+                match error {
+                    litebox_shim_optee::ElfLoaderError::UnverifiedTa => OpteeSmcReturnCode::EBadCmd,
+                    _ => OpteeSmcReturnCode::ENomem,
+                }
+            })?,
+    );
 
     let ta_flags = loaded_program.ta_flags;
 
@@ -1366,8 +1335,6 @@ fn open_session_new_instance(
             ldelf_return_code,
             None, // No session ID on failure
             None,
-            Some(ta_req_info),
-            None,
         );
         teardown_ta_page_table(platform, task_pt_id);
 
@@ -1379,21 +1346,16 @@ fn open_session_new_instance(
     session_manager().set_session_client_identity(runner_session_id, client_identity);
 
     // Load TA context with parameters for OpenSession - pass actual session_id
+    ta_req_info.session = runner_session_id;
     loaded_program.entrypoints.as_ref().ok_or_else(|| {
         teardown_ta_page_table(platform, task_pt_id);
         OpteeSmcReturnCode::EBadCmd
     })?;
-    let memref_addresses = loaded_program
+    loaded_program
         .entrypoints
         .as_ref()
         .unwrap()
-        .load_ta_context_with_shm(
-            params,
-            &ta_req_info.shm_info,
-            runner_session_id,
-            UteeEntryFunc::OpenSession as u32,
-            None,
-        )
+        .load_ta_context(ta_req_info)
         .map_err(|_| {
             teardown_ta_page_table(platform, task_pt_id);
             OpteeSmcReturnCode::EBadCmd
@@ -1407,18 +1369,6 @@ fn open_session_new_instance(
             &mut ctx,
         );
     }
-
-    // Read TA output parameters from the stack buffer
-    let params_address = loaded_program.params_address.ok_or_else(|| {
-        teardown_ta_page_table(platform, task_pt_id);
-        OpteeSmcReturnCode::EBadAddr
-    })?;
-    let ta_params = UserConstPtr::<Platform, UteeParams>::from_usize(params_address)
-        .read_at_offset(0)
-        .ok_or_else(|| {
-            teardown_ta_page_table(platform, task_pt_id);
-            OpteeSmcReturnCode::EBadAddr
-        })?;
 
     // Check the return code from the TA's OpenSession entry point
     let return_code: u32 = ctx.rax.trunc();
@@ -1439,9 +1389,7 @@ fn open_session_new_instance(
             msg_args_phys_addr,
             return_code,
             None, // No session ID on failure
-            Some(&ta_params),
             Some(ta_req_info),
-            Some(&memref_addresses),
         );
         teardown_ta_page_table(platform, task_pt_id);
 
@@ -1458,9 +1406,7 @@ fn open_session_new_instance(
         msg_args_phys_addr,
         return_code,
         Some(runner_session_id),
-        Some(&ta_params),
         Some(ta_req_info),
-        Some(&memref_addresses),
     )
     .inspect_err(|_| {
         teardown_ta_page_table(platform, task_pt_id);
@@ -1520,13 +1466,11 @@ fn handle_invoke_command(
     msg_args: &mut OpteeMsgArgs,
     msg_args_phys_addr: u64,
 ) -> Result<(), OpteeSmcReturnCode> {
-    let ta_req_info =
+    let mut ta_req_info =
         decode_ta_request(platform, msg_args).map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
     if ta_req_info.entry_func != UteeEntryFunc::InvokeCommand {
         return Err(OpteeSmcReturnCode::EBadCmd);
     }
-    let cmd_id = ta_req_info.cmd_id;
-    let params = &ta_req_info.params;
     let session_id = ta_req_info.session;
 
     if let Some(pta) = ClientPta::from_session_id(session_id) {
@@ -1553,19 +1497,13 @@ fn handle_invoke_command(
             "InvokeCommand: session_id={}, task_pt_id={}, cmd_id={}",
             session_id,
             task_pt_id,
-            cmd_id
+            ta_req_info.cmd_id
         );
 
         // Set up the entry-point parameters for InvokeCommand.
         let entrypoints_ref = instance.loaded_program().entrypoints.as_ref().unwrap();
-        let memref_addresses = entrypoints_ref
-            .load_ta_context_with_shm(
-                params.as_slice(),
-                &ta_req_info.shm_info,
-                session_id,
-                UteeEntryFunc::InvokeCommand as u32,
-                Some(cmd_id),
-            )
+        entrypoints_ref
+            .load_ta_context(&mut ta_req_info)
             .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
 
         let mut ctx = litebox_common_linux::PtRegs::default();
@@ -1575,15 +1513,6 @@ fn handle_invoke_command(
                 &mut ctx,
             );
         }
-
-        // params_address is constant - stack buffer is reused across invocations
-        let params_address = instance
-            .loaded_program()
-            .params_address
-            .ok_or(OpteeSmcReturnCode::EBadAddr)?;
-        let ta_params = UserConstPtr::<Platform, UteeParams>::from_usize(params_address)
-            .read_at_offset(0)
-            .ok_or(OpteeSmcReturnCode::EBadAddr)?;
 
         let return_code: u32 = ctx.rax.trunc();
         let return_code = TeeResult::try_from(return_code).unwrap_or(TeeResult::GenericError);
@@ -1597,9 +1526,7 @@ fn handle_invoke_command(
             msg_args_phys_addr,
             return_code,
             None,
-            Some(&ta_params),
             Some(&ta_req_info),
-            Some(&memref_addresses),
         );
 
         // Per OP-TEE OS: if TA panics (TARGET_DEAD), the TA context is
@@ -1671,18 +1598,15 @@ fn handle_close_session(
 
         let _task_pt_guard = TaskPageTableGuard::enter(platform, task_pt_id)?;
 
-        // Set up the entry-point parameters for CloseSession.
+        // Set up the entry-point parameters for CloseSession. The TA gets no params,
+        // whatever the normal world sent.
+        let mut close_request = TaRequestInfo::new(UteeEntryFunc::CloseSession, session_id, 0);
         instance
             .loaded_program()
             .entrypoints
             .as_ref()
             .unwrap()
-            .load_ta_context(
-                &[],
-                session_id,
-                UteeEntryFunc::CloseSession as u32,
-                None,
-            )
+            .load_ta_context(&mut close_request)
             .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
 
         // Run the TA entry function (TA_CloseSessionEntryPoint)
@@ -1700,8 +1624,6 @@ fn handle_close_session(
             msg_args,
             msg_args_phys_addr,
             TeeResult::Success,
-            None,
-            None,
             None,
             None,
         );
@@ -1765,16 +1687,13 @@ fn handle_close_session(
 ///
 /// Panics if called while the base page table is active (i.e., not in a TA context).
 #[inline]
-#[allow(clippy::too_many_arguments)]
 fn write_msg_args_to_normal_world(
     platform: &'static Platform,
     msg_args: &mut OpteeMsgArgs,
     msg_args_phys_addr: u64,
     return_code: TeeResult,
     session_id: Option<u32>,
-    ta_params: Option<&UteeParams>,
-    ta_req_info: Option<&litebox_shim_optee::msg_handler::TaRequestInfo<PAGE_SIZE>>,
-    memref_addresses: Option<&TaMemrefAddresses>,
+    ta_req_info: Option<&TaRequestInfo<PAGE_SIZE>>,
 ) -> Result<(), OpteeSmcReturnCode> {
     // Ensure we're on a task page table, not the base page table.
     // Accessing TA userspace memory requires the TA's page table to be active.
@@ -1794,9 +1713,7 @@ fn write_msg_args_to_normal_world(
         return_code,
         origin,
         session_id,
-        ta_params,
         ta_req_info,
-        memref_addresses,
         msg_args,
     )?;
 

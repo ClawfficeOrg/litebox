@@ -4,7 +4,7 @@
 //! Implementation of pseudo TAs (PTAs) which export system services as
 //! the functions of built-in TAs.
 
-use crate::msg_handler::{ShmInfo, TaRequestInfo, client_pta_params, update_optee_msg_args};
+use crate::msg_handler::{ParamOutputs, ShmInfo, TaRequestInfo, client_pta_params, write_back};
 use crate::{Task, UserConstPtr, UserMutPtr, idk::IdksPta, syscalls::Cleanup};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -124,7 +124,8 @@ impl ClientPta {
     ///
     /// # Errors
     ///
-    /// `EBadAddr` if shared memory cannot be written.
+    /// Fails if shared memory cannot be written or the outputs cannot be written back
+    /// (see [`update_optee_msg_args`](crate::msg_handler::update_optee_msg_args)).
     pub fn invoke_command<Platform: crate::OpteeShimPlatform>(
         self,
         platform: &Platform,
@@ -140,19 +141,15 @@ impl ClientPta {
                 &ta_req_info.shm_info,
             )?,
         };
-        // Outputs are meaningful only on these results; a rejected NULL memref
-        // would otherwise fail the size check.
-        let outputs =
-            matches!(result, TeeResult::Success | TeeResult::ShortBuffer).then_some(&params);
-        // Memref outputs were written in place: no `memref_addresses`.
-        update_optee_msg_args(
+        write_back(
             platform,
             result,
             TeeOrigin::TrustedApp,
             None,
-            outputs,
-            Some(ta_req_info),
-            None,
+            Some(ParamOutputs::ClientPta {
+                request: ta_req_info,
+                params: &params,
+            }),
             msg_args,
         )
     }
@@ -633,7 +630,7 @@ impl DevicePta {
             return Ok(TeeResult::BadParameters);
         };
         let blen = usize::try_from(blen).map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
-        // A NULL buffer has an empty `shm_info` regardless of `blen`.
+        // A NULL buffer has size 0, making the call a size query.
         let Some(out) = shm_info[0].as_ref().filter(|shm| shm.len() == blen) else {
             return Ok(TeeResult::BadParameters);
         };
@@ -642,7 +639,7 @@ impl DevicePta {
             .inner
             .read()
             .iter()
-            .map(|(uuid, info)| (*uuid, info.flags))
+            .map(|(uuid, info)| (*uuid, info.head.flags))
             .collect();
         let (size, data) = Self::device_list(rflags, tas, blen);
         out.write_at(platform, 0, &data)?;

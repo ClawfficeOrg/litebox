@@ -6,8 +6,9 @@
 use crate::Task;
 use aes::{
     Aes128, Aes192, Aes256,
-    cipher::{NewCipher, StreamCipher, generic_array::GenericArray},
+    cipher::{KeyIvInit, StreamCipher, generic_array::GenericArray},
 };
+use alloc::boxed::Box;
 use ctr::Ctr128BE;
 use litebox::platform::RawMutPointer;
 use litebox_common_optee::{
@@ -134,7 +135,7 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
                 #[cfg(not(debug_assertions))]
                 return Err(TeeResult::NotSupported);
             };
-            tee_cryp_state_map.set_cipher(state, &cipher)?;
+            tee_cryp_state_map.set_cipher(state, cipher)?;
             Ok(())
         } else {
             Err(TeeResult::BadParameters)
@@ -321,8 +322,8 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
     }
 }
 
-fn create_cipher(algo: TeeAlgorithm, key: &[u8], iv: &[u8]) -> Option<Cipher> {
-    match algo {
+fn create_cipher(algo: TeeAlgorithm, key: &[u8], iv: &[u8]) -> Option<Box<Cipher>> {
+    let cipher = match algo {
         TeeAlgorithm::AesCtr if iv.len() != 16 => None,
         TeeAlgorithm::AesCtr => match key.len() {
             16 => Some(Cipher::Aes128Ctr(Ctr128BE::<Aes128>::new(
@@ -340,5 +341,6 @@ fn create_cipher(algo: TeeAlgorithm, key: &[u8], iv: &[u8]) -> Option<Cipher> {
             _ => None,
         },
         _ => None,
-    }
+    };
+    cipher.map(Box::new)
 }

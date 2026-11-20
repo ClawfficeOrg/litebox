@@ -160,7 +160,7 @@ impl<Platform: crate::OpteeShimPlatform> TaInstance<Platform> {
 }
 
 // SAFETY: `SessionManager` serializes access to each instance's non-`Sync`
-// entrypoints and `Cell` state. The remaining fields are `Send + Sync` under the
+// entrypoints and `Cell`/`RefCell` state. The remaining fields are `Send + Sync` under the
 // `OpteeShimPlatform` bound. See the module-level concurrency model.
 unsafe impl<Platform: crate::OpteeShimPlatform> Send for TaInstance<Platform> {}
 unsafe impl<Platform: crate::OpteeShimPlatform> Sync for TaInstance<Platform> {}
@@ -1019,7 +1019,6 @@ mod tests {
     fn make_loaded_program(ta_flags: TaFlags) -> alloc::boxed::Box<LoadedProgram<Platform>> {
         alloc::boxed::Box::new(LoadedProgram {
             entrypoints: None,
-            params_address: None,
             ta_flags,
         })
     }

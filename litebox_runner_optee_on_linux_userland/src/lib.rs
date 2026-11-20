@@ -3,8 +3,9 @@
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
-use litebox_common_optee::{UteeEntryFunc, UteeParamOwned};
+use litebox_common_optee::UteeEntryFunc;
 use litebox_platform_linux_userland::LinuxUserland as Platform;
+use litebox_shim_optee::msg_handler::TaRequestInfo;
 use litebox_shim_optee::session::SessionManager;
 use std::path::PathBuf;
 
@@ -66,7 +67,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         }
     };
 
-    let prog_data: Vec<u8> = {
+    // The shim requires embedded TAs to be `'static`.
+    let prog_data: &'static [u8] = Vec::leak({
         let prog = PathBuf::from(&cli_args.program);
         let data =
             std::fs::read(&prog).with_context(|| format!("failed to read {}", cli_args.program))?;
@@ -76,7 +78,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         } else {
             data
         }
-    };
+    });
 
     // TODO(jb): Clean up platform initialization once we have https://github.com/MSRSSP/litebox/issues/24
     let platform = Platform::new(None);
@@ -90,12 +92,12 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     platform.initialize_boot_specific_kdf_support();
 
     if cli_args.command_sequence.is_empty() {
-        run_ta_with_default_commands(&shim, ldelf_data.as_slice(), prog_data.as_slice());
+        run_ta_with_default_commands(&shim, ldelf_data.as_slice(), prog_data);
     } else {
         tests::run_ta_with_test_commands(
             &shim,
             ldelf_data.as_slice(),
-            prog_data.as_slice(),
+            prog_data,
             cli_args.program.as_str(),
             &PathBuf::from(&cli_args.command_sequence),
         );
@@ -109,15 +111,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 fn run_ta_with_default_commands(
     shim: &litebox_shim_optee::OpteeShim<Platform>,
     ldelf_bin: &[u8],
-    ta_bin: &[u8],
+    ta_bin: &'static [u8],
 ) {
     let ta_uuid = litebox_common_optee::parse_ta_head(ta_bin)
         .expect("Failed to parse TA header from ta_bin")
         .uuid;
     assert!(shim.store_embedded_ta_bin(ta_bin));
     for func_id in [UteeEntryFunc::OpenSession, UteeEntryFunc::CloseSession] {
-        let params = [const { UteeParamOwned::None }; UteeParamOwned::TEE_NUM_PARAMS];
-
         if func_id == UteeEntryFunc::OpenSession {
             let session_token = shim
                 .session_manager()
@@ -125,7 +125,7 @@ fn run_ta_with_default_commands(
                 .unwrap();
             let session_id = session_token.session_id().unwrap();
             let loaded_program = shim
-                .load_ldelf(ldelf_bin, ta_uuid)
+                .load_ldelf(ldelf_bin, ta_uuid, None)
                 .map_err(|_| {
                     panic!("Failed to load ldelf");
                 })
@@ -141,11 +141,10 @@ fn run_ta_with_default_commands(
             // In OP-TEE TA, each command invocation is like (re)starting the TA with a new stack with
             // loaded binary and heap. In that sense, we can create (and destroy) a stack
             // for each command freely.
-            let _ = entrypoints
-                .load_ta_context(params.as_slice(), session_id, func_id as u32, None)
-                .map_err(|_| {
-                    panic!("Failed to load TA context");
-                });
+            let mut request = TaRequestInfo::new(func_id, session_id, 0);
+            entrypoints
+                .load_ta_context(&mut request)
+                .expect("Failed to load TA context");
             unsafe {
                 litebox_platform_linux_userland::reenter_thread(
                     entrypoints,
